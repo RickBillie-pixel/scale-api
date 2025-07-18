@@ -4,9 +4,9 @@ import math
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 import numpy as np
 import json
 
@@ -60,6 +60,76 @@ class Text(BaseModel):
 class InputData(BaseModel):
     vector_data: List[Vector] = Field(..., alias="vector_data")
     texts: List[Text]
+
+    # Validator to handle and fix potential input issues
+    @validator('vector_data', pre=True)
+    def validate_vectors(cls, v):
+        if not v:
+            return []
+            
+        valid_vectors = []
+        for item in v:
+            try:
+                # Check for required fields
+                if not isinstance(item, dict):
+                    continue
+                    
+                if 'p1' not in item or 'p2' not in item:
+                    continue
+                    
+                # Ensure p1 and p2 have valid x and y
+                if not all(k in item['p1'] for k in ['x', 'y']) or not all(k in item['p2'] for k in ['x', 'y']):
+                    continue
+                    
+                # Convert string numbers to float if needed
+                for point in ['p1', 'p2']:
+                    for coord in ['x', 'y']:
+                        if isinstance(item[point][coord], str):
+                            try:
+                                item[point][coord] = float(item[point][coord])
+                            except ValueError:
+                                item[point][coord] = 0.0
+                
+                valid_vectors.append(item)
+            except Exception as e:
+                logger.warning(f"Skipping invalid vector: {e}")
+                continue
+                
+        return valid_vectors
+
+    @validator('texts', pre=True)
+    def validate_texts(cls, v):
+        if not v:
+            return []
+            
+        valid_texts = []
+        for item in v:
+            try:
+                # Check for required fields
+                if not isinstance(item, dict):
+                    continue
+                    
+                if 'text' not in item or 'position' not in item:
+                    continue
+                    
+                # Ensure position has valid x and y
+                if not all(k in item['position'] for k in ['x', 'y']):
+                    continue
+                    
+                # Convert string numbers to float if needed
+                for coord in ['x', 'y']:
+                    if isinstance(item['position'][coord], str):
+                        try:
+                            item['position'][coord] = float(item['position'][coord])
+                        except ValueError:
+                            item['position'][coord] = 0.0
+                            
+                valid_texts.append(item)
+            except Exception as e:
+                logger.warning(f"Skipping invalid text: {e}")
+                continue
+                
+        return valid_texts
 
 class DimensionData(BaseModel):
     value: float
@@ -286,24 +356,58 @@ def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
     )
 
 @app.post("/extract-scale/", response_model=OutputData)
-async def extract_scale(file: UploadFile):
+async def extract_scale(file: UploadFile = File(...)):
     """Extract scale from a JSON file containing vector data and dimension texts"""
     try:
         # Read and parse the uploaded JSON file
         contents = await file.read()
-        input_data = json.loads(contents.decode('utf-8'))
+        
+        try:
+            input_data = json.loads(contents.decode('utf-8'))
+            logger.info(f"Successfully parsed JSON input")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid JSON format: {str(e)}"
+            )
         
         # Validate input data
-        if not input_data.get('vector_data') or not input_data.get('texts'):
+        if not input_data.get('vector_data') and not input_data.get('texts'):
+            logger.warning("Input missing both vector_data and texts")
             raise HTTPException(
                 status_code=400,
                 detail="Input must include both vector_data and texts"
             )
+            
+        # Print received data for debugging
+        logger.info(f"Received data with {len(input_data.get('vector_data', []))} vectors and {len(input_data.get('texts', []))} texts")
+        
+        # If empty arrays were provided, return a default response
+        if len(input_data.get('vector_data', [])) == 0:
+            logger.warning("No vector data provided")
+            raise HTTPException(
+                status_code=400,
+                detail="No vector data provided. Input must include lines or curves with p1 and p2 points."
+            )
+        
+        if len(input_data.get('texts', [])) == 0:
+            logger.warning("No text data provided")
+            raise HTTPException(
+                status_code=400,
+                detail="No text data provided. Input must include dimension texts."
+            )
         
         # Convert to Pydantic model for validation
-        data = InputData(**input_data)
-        
-        logger.info(f"Processing {len(data.vector_data)} vectors and {len(data.texts)} texts")
+        try:
+            data = InputData(**input_data)
+            logger.info(f"Data validated: {len(data.vector_data)} vectors and {len(data.texts)} texts")
+        except Exception as e:
+            logger.error(f"Data validation error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid data structure: {str(e)}"
+            )
         
         # Process horizontal lines
         horiz_matches, horiz_checked = match_dimensions_to_lines(
@@ -353,9 +457,15 @@ async def extract_scale(file: UploadFile):
             else:
                 average_scale = calculate_scale_stats(all_filtered, threshold)
         else:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid dimension-line matches found. Ensure dimension texts are near their corresponding lines."
+            logger.warning("No valid dimension-line matches found")
+            # Return a default response instead of failing
+            average_scale = ScaleResult(
+                points_per_cm=0.0,
+                cm_per_point=0.0,
+                points_per_m=0.0,
+                m_per_point=0.0,
+                confidence=0.0,
+                samples=0
             )
         
         # Prepare matched dimensions for output
