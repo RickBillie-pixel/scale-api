@@ -1,18 +1,14 @@
-"""
-Optimized Scale Calculation API for Technical CAD Drawings
-Calculates precise scale from vector data and dimension texts
-"""
-
 import os
 import re
 import math
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import numpy as np
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -29,7 +25,7 @@ MIN_CONFIDENCE = 0.0
 OUTLIER_Z_SCORE = 2.0
 
 app = FastAPI(
-    title="Scale Calculation API",
+    title="Optimized Scale Calculation API",
     description="Calculates precise scale from CAD vector data and dimension texts",
     version="2.0.0"
 )
@@ -135,95 +131,49 @@ def determine_orientation(p1: Point, p2: Point, angle_threshold: float = 10.0) -
 
 def calculate_perpendicular_distance(line_p1: Point, line_p2: Point, point: Point) -> float:
     """Calculate perpendicular distance from point to line segment"""
-    # Vector from p1 to p2
     dx = line_p2.x - line_p1.x
     dy = line_p2.y - line_p1.y
-    
-    # Vector from p1 to point
     px = point.x - line_p1.x
     py = point.y - line_p1.y
-    
-    # Line length squared
     line_length_sq = dx * dx + dy * dy
-    
     if line_length_sq == 0:
-        # Line is a point
         return math.sqrt(px * px + py * py)
-    
-    # Parameter t of the projection
     t = max(0, min(1, (px * dx + py * dy) / line_length_sq))
-    
-    # Projection point on the line
     proj_x = line_p1.x + t * dx
     proj_y = line_p1.y + t * dy
-    
-    # Distance from point to projection
     return math.sqrt((point.x - proj_x)**2 + (point.y - proj_y)**2)
 
 def extract_dimension(text: str) -> Optional[DimensionData]:
     """Extract dimension value and unit from text"""
-    # Clean text
     text = text.strip()
-    
-    # Comprehensive patterns for dimension extraction
     patterns = [
-        # With units
         (r'(\d+(?:[.,]\d+)?)\s*(mm|cm|m|meter|metre)\b', 'metric'),
         (r'(\d+(?:[.,]\d+)?)\s*(?:"|″|inch|inches|in)\b', 'inch'),
         (r'(\d+(?:[.,]\d+)?)\s*(?:\'|′|ft|foot|feet)\b', 'feet'),
-        
-        # Diameter and radius
         (r'[ØΦ⌀]\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?', 'diameter'),
         (r'R\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?', 'radius'),
-        
-        # Just numbers (assume mm)
         (r'^(\d+(?:[.,]\d+)?)$', 'number'),
-        
-        # Numbers with multiplication
         (r'(\d+)\s*[xX×]\s*(\d+(?:[.,]\d+)?)', 'multiply'),
     ]
-    
     for pattern, pattern_type in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             try:
-                # Extract value (handle comma as decimal separator)
                 value_str = match.group(1).replace(',', '.')
                 value = float(value_str)
-                
-                # Extract unit or default to mm
                 if pattern_type == 'metric' and match.group(2):
                     unit = match.group(2).lower()
                 elif pattern_type == 'inch':
                     unit = 'in'
-                    value = value  # Keep original value
                 elif pattern_type == 'feet':
                     unit = 'ft'
-                    value = value  # Keep original value
                 else:
                     unit = 'mm'
-                
-                # Convert to mm
-                conversions = {
-                    'mm': 1.0,
-                    'cm': 10.0,
-                    'm': 1000.0,
-                    'meter': 1000.0,
-                    'metre': 1000.0,
-                    'in': 25.4,
-                    'ft': 304.8
-                }
-                
+                conversions = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'meter': 1000.0, 'metre': 1000.0, 'in': 25.4, 'ft': 304.8}
                 value_mm = value * conversions.get(unit, 1.0)
-                
-                return DimensionData(
-                    value=value,
-                    unit=unit,
-                    value_mm=value_mm
-                )
+                return DimensionData(value=value, unit=unit, value_mm=value_mm)
             except (ValueError, IndexError):
                 continue
-    
     return None
 
 def sigmoid(x: float, steepness: float = 1.0) -> float:
@@ -237,19 +187,11 @@ def calculate_confidence(
     threshold: float
 ) -> float:
     """Calculate confidence score based on multiple factors"""
-    # Sample score (40% weight) - more samples = higher confidence
     sample_score = 40 * sigmoid((samples - 1) / 5.0, steepness=2.0)
-    
-    # Consistency score (40% weight) - lower variation = higher confidence
     consistency_score = 40 * (1 - consistency) if consistency < 1 else 0
-    
-    # Distance quality score (20% weight) - closer matches = higher confidence
     distance_ratio = min(1.0, avg_distance / threshold)
     quality_score = 20 * (1 - distance_ratio)
-    
-    # Total confidence
     confidence = sample_score + consistency_score + quality_score
-    
     return max(0, min(100, confidence))
 
 def match_dimensions_to_lines(
@@ -260,57 +202,32 @@ def match_dimensions_to_lines(
     """Match dimension texts to their corresponding lines for a specific orientation"""
     matches = []
     total_checked = 0
-    
-    # Filter vectors by orientation
-    oriented_vectors = []
-    for vec in vectors:
-        # Calculate length if not provided
-        if vec.length is None:
-            vec.length = calculate_line_length(vec.p1, vec.p2)
-        
-        # Determine orientation if not provided
-        if vec.orientation is None:
-            vec.orientation = determine_orientation(vec.p1, vec.p2)
-        
-        if vec.orientation == orientation and vec.length > 0:
-            oriented_vectors.append(vec)
-    
+    oriented_vectors = [v for v in vectors if v.orientation == orientation or (v.orientation is None and determine_orientation(v.p1, v.p2) == orientation)]
     if not oriented_vectors:
         return [], 0
-    
-    # Calculate dynamic threshold
-    avg_line_length = np.mean([v.length for v in oriented_vectors])
+    avg_line_length = np.mean([v.length if v.length else calculate_line_length(v.p1, v.p2) for v in oriented_vectors])
     threshold = max(MIN_DISTANCE_THRESHOLD, avg_line_length * DISTANCE_THRESHOLD_FACTOR)
-    
-    # Match each line with the closest valid dimension text
     for vec in oriented_vectors:
+        if vec.length is None:
+            vec.length = calculate_line_length(vec.p1, vec.p2)
+        if vec.orientation is None:
+            vec.orientation = determine_orientation(vec.p1, vec.p2)
         midpoint = get_midpoint(vec.p1, vec.p2)
         best_match = None
         best_distance = float('inf')
-        
         for txt in texts:
             total_checked += 1
-            
-            # Calculate distance from text to line
             perp_dist = calculate_perpendicular_distance(vec.p1, vec.p2, txt.position)
-            
-            # Also consider distance to midpoint
             mid_dist = calculate_line_length(midpoint, txt.position)
-            
-            # Use minimum distance
             min_dist = min(perp_dist, mid_dist)
-            
             if min_dist < threshold and min_dist < best_distance:
-                # Try to extract dimension
                 dim = extract_dimension(txt.text)
                 if dim and dim.value_mm > 0:
                     best_distance = min_dist
                     best_match = (txt, dim)
-        
         if best_match:
             txt, dim = best_match
             points_per_mm = vec.length / dim.value_mm
-            
             matches.append({
                 "line": vec,
                 "text": txt,
@@ -318,37 +235,23 @@ def match_dimensions_to_lines(
                 "match_distance": best_distance,
                 "points_per_mm": points_per_mm
             })
-    
     return matches, total_checked
 
 def filter_outliers(matches: List[Dict]) -> List[Dict]:
     """Filter outliers using z-score method"""
     if len(matches) < 3:
         return matches
-    
     scales = [m['points_per_mm'] for m in matches]
     mean_scale = np.mean(scales)
     std_scale = np.std(scales)
-    
     if std_scale == 0:
         return matches
-    
-    # Calculate z-scores
     z_scores = [(s - mean_scale) / std_scale for s in scales]
-    
-    # Filter based on z-score threshold
-    filtered_matches = [
-        m for i, m in enumerate(matches)
-        if abs(z_scores[i]) <= OUTLIER_Z_SCORE
-    ]
-    
-    # Ensure we keep at least 30% of matches
+    filtered_matches = [m for i, m in enumerate(matches) if abs(z_scores[i]) <= OUTLIER_Z_SCORE]
     if len(filtered_matches) < max(1, len(matches) * 0.3):
-        # Sort by z-score and keep the best ones
         sorted_indices = sorted(range(len(matches)), key=lambda i: abs(z_scores[i]))
         keep_count = max(1, int(len(matches) * 0.3))
         filtered_matches = [matches[i] for i in sorted_indices[:keep_count]]
-    
     return filtered_matches
 
 def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
@@ -362,33 +265,17 @@ def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
             confidence=0.0,
             samples=0
         )
-    
-    # Extract scales
     scales_mm = [m['points_per_mm'] for m in matches]
     mean_scale_mm = np.mean(scales_mm)
-    
-    # Calculate consistency (coefficient of variation)
     if len(scales_mm) > 1:
         std_scale_mm = np.std(scales_mm)
         consistency = std_scale_mm / mean_scale_mm if mean_scale_mm > 0 else 1.0
     else:
-        consistency = 0.0  # Perfect consistency for single sample
-    
-    # Calculate average match distance
+        consistency = 0.0
     avg_distance = np.mean([m['match_distance'] for m in matches])
-    
-    # Calculate confidence
-    confidence = calculate_confidence(
-        samples=len(matches),
-        consistency=consistency,
-        avg_distance=avg_distance,
-        threshold=threshold
-    )
-    
-    # Convert to different units
+    confidence = calculate_confidence(len(matches), consistency, avg_distance, threshold)
     points_per_cm = mean_scale_mm * 10
     points_per_m = mean_scale_mm * 1000
-    
     return ScaleResult(
         points_per_cm=round(points_per_cm, 4),
         cm_per_point=round(1 / points_per_cm, 4) if points_per_cm > 0 else 0.0,
@@ -399,15 +286,22 @@ def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
     )
 
 @app.post("/extract-scale/", response_model=OutputData)
-async def extract_scale(data: InputData):
-    """Extract scale from vector data and dimension texts"""
+async def extract_scale(file: UploadFile):
+    """Extract scale from a JSON file containing vector data and dimension texts"""
     try:
-        # Validate input
-        if not data.vector_data or not data.texts:
+        # Read and parse the uploaded JSON file
+        contents = await file.read()
+        input_data = json.loads(contents.decode('utf-8'))
+        
+        # Validate input data
+        if not input_data.get('vector_data') or not input_data.get('texts'):
             raise HTTPException(
                 status_code=400,
                 detail="Input must include both vector_data and texts"
             )
+        
+        # Convert to Pydantic model for validation
+        data = InputData(**input_data)
         
         logger.info(f"Processing {len(data.vector_data)} vectors and {len(data.texts)} texts")
         
@@ -436,12 +330,10 @@ async def extract_scale(data: InputData):
         # Calculate average scale
         all_filtered = horiz_filtered + vert_filtered
         if all_filtered:
-            # Weighted average based on number of samples
             total_samples = horizontal_scale.samples + vertical_scale.samples
             if total_samples > 0:
                 horiz_weight = horizontal_scale.samples / total_samples
                 vert_weight = vertical_scale.samples / total_samples
-                
                 avg_points_per_cm = (
                     horizontal_scale.points_per_cm * horiz_weight +
                     vertical_scale.points_per_cm * vert_weight
@@ -450,7 +342,6 @@ async def extract_scale(data: InputData):
                     horizontal_scale.confidence * horiz_weight +
                     vertical_scale.confidence * vert_weight
                 )
-                
                 average_scale = ScaleResult(
                     points_per_cm=round(avg_points_per_cm, 4),
                     cm_per_point=round(1 / avg_points_per_cm, 4) if avg_points_per_cm > 0 else 0.0,
@@ -518,12 +409,12 @@ async def extract_scale(data: InputData):
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Scale Calculation API",
+        "message": "Optimized Scale Calculation API",
         "version": "2.0.0",
         "description": "Calculates precise scale from CAD vector data and dimension texts",
         "endpoints": {
             "/": "This page",
-            "/extract-scale/": "POST - Calculate scale from vector data and texts",
+            "/extract-scale/": "POST - Calculate scale from vector data and texts JSON file",
             "/health/": "GET - Health check"
         }
     }
