@@ -4,11 +4,10 @@ import math
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, HTTPException, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 import numpy as np
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -19,15 +18,14 @@ logger = logging.getLogger(__name__)
 
 # Constants
 PORT = int(os.environ.get("PORT", 10000))
-DISTANCE_THRESHOLD_FACTOR = 0.05  # 5% of average line length
-MIN_DISTANCE_THRESHOLD = 50.0
-MIN_CONFIDENCE = 0.0
+DISTANCE_THRESHOLD_FACTOR = 0.1  # 10% of average line length for regions
+MIN_DISTANCE_THRESHOLD = 20.0
 OUTLIER_Z_SCORE = 2.0
 
 app = FastAPI(
-    title="Optimized Scale Calculation API",
-    description="Calculates precise scale from CAD vector data and dimension texts",
-    version="2.0.0"
+    title="Region-Based Scale Calculation API",
+    description="Calculates scale per region from filtered vector data",
+    version="1.0.0"
 )
 
 # CORS middleware
@@ -39,98 +37,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models
-class Point(BaseModel):
+# Input Models - matching Filter API output
+class CleanPoint(BaseModel):
     x: float
     y: float
 
-class Vector(BaseModel):
-    type: str = "line"
-    p1: Point
-    p2: Point
-    length: Optional[float] = None
-    orientation: Optional[str] = None
+class CleanLine(BaseModel):
+    p1: CleanPoint
+    p2: CleanPoint
+    length: float
+    orientation: str
+    midpoint: CleanPoint
 
-class Text(BaseModel):
+class CleanText(BaseModel):
     text: str
-    position: Point
-    bbox: Optional[Dict[str, float]] = None
-    source: Optional[str] = None
+    position: CleanPoint
+    bounding_box: List[float]
 
-class InputData(BaseModel):
-    vector_data: List[Vector] = Field(..., alias="vector_data")
-    texts: List[Text]
+class RegionData(BaseModel):
+    label: str
+    lines: List[CleanLine]
+    texts: List[CleanText]
 
-    # Validator to handle and fix potential input issues
-    @validator('vector_data', pre=True)
-    def validate_vectors(cls, v):
-        if not v:
-            return []
-            
-        valid_vectors = []
-        for item in v:
-            try:
-                # Check for required fields
-                if not isinstance(item, dict):
-                    continue
-                    
-                if 'p1' not in item or 'p2' not in item:
-                    continue
-                    
-                # Ensure p1 and p2 have valid x and y
-                if not all(k in item['p1'] for k in ['x', 'y']) or not all(k in item['p2'] for k in ['x', 'y']):
-                    continue
-                    
-                # Convert string numbers to float if needed
-                for point in ['p1', 'p2']:
-                    for coord in ['x', 'y']:
-                        if isinstance(item[point][coord], str):
-                            try:
-                                item[point][coord] = float(item[point][coord])
-                            except ValueError:
-                                item[point][coord] = 0.0
-                
-                valid_vectors.append(item)
-            except Exception as e:
-                logger.warning(f"Skipping invalid vector: {e}")
-                continue
-                
-        return valid_vectors
+class FilteredInput(BaseModel):
+    drawing_type: str
+    regions: List[RegionData]
 
-    @validator('texts', pre=True)
-    def validate_texts(cls, v):
-        if not v:
-            return []
-            
-        valid_texts = []
-        for item in v:
-            try:
-                # Check for required fields
-                if not isinstance(item, dict):
-                    continue
-                    
-                if 'text' not in item or 'position' not in item:
-                    continue
-                    
-                # Ensure position has valid x and y
-                if not all(k in item['position'] for k in ['x', 'y']):
-                    continue
-                    
-                # Convert string numbers to float if needed
-                for coord in ['x', 'y']:
-                    if isinstance(item['position'][coord], str):
-                        try:
-                            item['position'][coord] = float(item['position'][coord])
-                        except ValueError:
-                            item['position'][coord] = 0.0
-                            
-                valid_texts.append(item)
-            except Exception as e:
-                logger.warning(f"Skipping invalid text: {e}")
-                continue
-                
-        return valid_texts
-
+# Output Models
 class DimensionData(BaseModel):
     value: float
     unit: str
@@ -151,6 +84,7 @@ class DimensionMatch(BaseModel):
     text: MatchedText
     dimension: DimensionData
     match_distance: float
+    points_per_mm: float
 
 class ScaleResult(BaseModel):
     points_per_cm: float
@@ -160,78 +94,67 @@ class ScaleResult(BaseModel):
     confidence: float
     samples: int
 
-class OutputData(BaseModel):
-    scale: Dict[str, ScaleResult]
+class RegionScaleResult(BaseModel):
+    region_label: str
+    scale: Dict[str, ScaleResult]  # horizontal/vertical
     average: ScaleResult
-    unit: str = "cm"
     valid_pairs_used: int
     total_matches_checked: int
     matched_dimensions: List[DimensionMatch]
 
+class ScaleOutput(BaseModel):
+    drawing_type: str
+    regions: List[RegionScaleResult]
+    overall_average: ScaleResult
+    total_valid_pairs: int
+
 # Utility functions
-def calculate_line_length(p1: Point, p2: Point) -> float:
+def calculate_distance(p1: CleanPoint, p2: CleanPoint) -> float:
     """Calculate Euclidean distance between two points"""
     return math.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2)
 
-def get_midpoint(p1: Point, p2: Point) -> Point:
-    """Calculate midpoint of a line segment"""
-    return Point(x=(p1.x + p2.x) / 2, y=(p1.y + p2.y) / 2)
-
-def determine_orientation(p1: Point, p2: Point, angle_threshold: float = 10.0) -> str:
-    """
-    Determine line orientation (horizontal, vertical, or diagonal)
-    angle_threshold: degrees from horizontal/vertical to still consider it aligned
-    """
-    dx = abs(p2.x - p1.x)
-    dy = abs(p2.y - p1.y)
-    
-    if dx == 0 and dy == 0:
-        return "point"
-    
-    angle = math.degrees(math.atan2(dy, dx))
-    
-    # Check if near horizontal (0 or 180 degrees)
-    if angle < angle_threshold or angle > (180 - angle_threshold):
-        return "horizontal"
-    # Check if near vertical (90 degrees)
-    elif abs(angle - 90) < angle_threshold:
-        return "vertical"
-    else:
-        return "diagonal"
-
-def calculate_perpendicular_distance(line_p1: Point, line_p2: Point, point: Point) -> float:
+def calculate_perpendicular_distance(line_p1: CleanPoint, line_p2: CleanPoint, point: CleanPoint) -> float:
     """Calculate perpendicular distance from point to line segment"""
     dx = line_p2.x - line_p1.x
     dy = line_p2.y - line_p1.y
     px = point.x - line_p1.x
     py = point.y - line_p1.y
     line_length_sq = dx * dx + dy * dy
+    
     if line_length_sq == 0:
         return math.sqrt(px * px + py * py)
+    
     t = max(0, min(1, (px * dx + py * dy) / line_length_sq))
     proj_x = line_p1.x + t * dx
     proj_y = line_p1.y + t * dy
+    
     return math.sqrt((point.x - proj_x)**2 + (point.y - proj_y)**2)
 
 def extract_dimension(text: str) -> Optional[DimensionData]:
     """Extract dimension value and unit from text"""
     text = text.strip()
+    
+    # Common dimension patterns
     patterns = [
         (r'(\d+(?:[.,]\d+)?)\s*(mm|cm|m|meter|metre)\b', 'metric'),
         (r'(\d+(?:[.,]\d+)?)\s*(?:"|″|inch|inches|in)\b', 'inch'),
         (r'(\d+(?:[.,]\d+)?)\s*(?:\'|′|ft|foot|feet)\b', 'feet'),
-        (r'[ØΦ⌀]\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?', 'diameter'),
-        (r'R\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?', 'radius'),
-        (r'^(\d+(?:[.,]\d+)?)$', 'number'),
-        (r'(\d+)\s*[xX×]\s*(\d+(?:[.,]\d+)?)', 'multiply'),
+        (r'^(\d{3,5})$', 'mm'),  # 3-5 digit numbers assumed to be mm
+        (r'^(\d+)$', 'mm'),  # Any standalone number assumed to be mm
     ]
+    
     for pattern, pattern_type in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             try:
                 value_str = match.group(1).replace(',', '.')
                 value = float(value_str)
-                if pattern_type == 'metric' and match.group(2):
+                
+                # Skip very small values
+                if value < 10:
+                    continue
+                
+                if pattern_type == 'metric' and len(match.groups()) > 1:
                     unit = match.group(2).lower()
                 elif pattern_type == 'inch':
                     unit = 'in'
@@ -239,92 +162,100 @@ def extract_dimension(text: str) -> Optional[DimensionData]:
                     unit = 'ft'
                 else:
                     unit = 'mm'
-                conversions = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'meter': 1000.0, 'metre': 1000.0, 'in': 25.4, 'ft': 304.8}
+                
+                # Convert to mm
+                conversions = {
+                    'mm': 1.0,
+                    'cm': 10.0,
+                    'm': 1000.0,
+                    'meter': 1000.0,
+                    'metre': 1000.0,
+                    'in': 25.4,
+                    'ft': 304.8
+                }
                 value_mm = value * conversions.get(unit, 1.0)
+                
                 return DimensionData(value=value, unit=unit, value_mm=value_mm)
             except (ValueError, IndexError):
                 continue
+    
     return None
 
-def sigmoid(x: float, steepness: float = 1.0) -> float:
-    """Sigmoid function for confidence calculation"""
-    return 1 / (1 + math.exp(-steepness * x))
-
-def calculate_confidence(
-    samples: int,
-    consistency: float,
-    avg_distance: float,
-    threshold: float
-) -> float:
-    """Calculate confidence score based on multiple factors"""
-    sample_score = 40 * sigmoid((samples - 1) / 5.0, steepness=2.0)
-    consistency_score = 40 * (1 - consistency) if consistency < 1 else 0
-    distance_ratio = min(1.0, avg_distance / threshold)
-    quality_score = 20 * (1 - distance_ratio)
-    confidence = sample_score + consistency_score + quality_score
-    return max(0, min(100, confidence))
-
-def match_dimensions_to_lines(
-    vectors: List[Vector],
-    texts: List[Text],
-    orientation: str
-) -> Tuple[List[Dict], int]:
-    """Match dimension texts to their corresponding lines for a specific orientation"""
+def match_dimensions_in_region(region: RegionData, orientation: str) -> Tuple[List[Dict], int]:
+    """Match dimension texts to lines within a region"""
     matches = []
     total_checked = 0
-    oriented_vectors = [v for v in vectors if v.orientation == orientation or (v.orientation is None and determine_orientation(v.p1, v.p2) == orientation)]
-    if not oriented_vectors:
+    
+    # Filter lines by orientation
+    oriented_lines = [line for line in region.lines if line.orientation == orientation]
+    
+    if not oriented_lines:
         return [], 0
-    avg_line_length = np.mean([v.length if v.length else calculate_line_length(v.p1, v.p2) for v in oriented_vectors])
+    
+    # Calculate average line length for threshold
+    avg_line_length = np.mean([line.length for line in oriented_lines])
     threshold = max(MIN_DISTANCE_THRESHOLD, avg_line_length * DISTANCE_THRESHOLD_FACTOR)
-    for vec in oriented_vectors:
-        if vec.length is None:
-            vec.length = calculate_line_length(vec.p1, vec.p2)
-        if vec.orientation is None:
-            vec.orientation = determine_orientation(vec.p1, vec.p2)
-        midpoint = get_midpoint(vec.p1, vec.p2)
+    
+    logger.info(f"Region {region.label} - {orientation}: {len(oriented_lines)} lines, threshold: {threshold:.1f}")
+    
+    for line in oriented_lines:
         best_match = None
         best_distance = float('inf')
-        for txt in texts:
+        
+        for text in region.texts:
             total_checked += 1
-            perp_dist = calculate_perpendicular_distance(vec.p1, vec.p2, txt.position)
-            mid_dist = calculate_line_length(midpoint, txt.position)
+            
+            # Calculate distances
+            perp_dist = calculate_perpendicular_distance(line.p1, line.p2, text.position)
+            mid_dist = calculate_distance(line.midpoint, text.position)
             min_dist = min(perp_dist, mid_dist)
+            
             if min_dist < threshold and min_dist < best_distance:
-                dim = extract_dimension(txt.text)
+                dim = extract_dimension(text.text)
                 if dim and dim.value_mm > 0:
                     best_distance = min_dist
-                    best_match = (txt, dim)
+                    best_match = (text, dim)
+        
         if best_match:
-            txt, dim = best_match
-            points_per_mm = vec.length / dim.value_mm
+            text, dim = best_match
+            points_per_mm = line.length / dim.value_mm
+            
             matches.append({
-                "line": vec,
-                "text": txt,
+                "line": line,
+                "text": text,
                 "dimension": dim,
                 "match_distance": best_distance,
                 "points_per_mm": points_per_mm
             })
+            
+            logger.info(f"  Match: {dim.value}{dim.unit} -> {line.length:.1f}pt = {points_per_mm:.3f} pt/mm")
+    
     return matches, total_checked
 
 def filter_outliers(matches: List[Dict]) -> List[Dict]:
     """Filter outliers using z-score method"""
     if len(matches) < 3:
         return matches
+    
     scales = [m['points_per_mm'] for m in matches]
     mean_scale = np.mean(scales)
     std_scale = np.std(scales)
+    
     if std_scale == 0:
         return matches
+    
     z_scores = [(s - mean_scale) / std_scale for s in scales]
     filtered_matches = [m for i, m in enumerate(matches) if abs(z_scores[i]) <= OUTLIER_Z_SCORE]
+    
+    # Keep at least 30% of matches
     if len(filtered_matches) < max(1, len(matches) * 0.3):
         sorted_indices = sorted(range(len(matches)), key=lambda i: abs(z_scores[i]))
         keep_count = max(1, int(len(matches) * 0.3))
         filtered_matches = [matches[i] for i in sorted_indices[:keep_count]]
+    
     return filtered_matches
 
-def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
+def calculate_scale_stats(matches: List[Dict]) -> ScaleResult:
     """Calculate scale statistics from matches"""
     if not matches:
         return ScaleResult(
@@ -335,17 +266,25 @@ def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
             confidence=0.0,
             samples=0
         )
+    
     scales_mm = [m['points_per_mm'] for m in matches]
     mean_scale_mm = np.mean(scales_mm)
+    
+    # Calculate confidence based on consistency
     if len(scales_mm) > 1:
         std_scale_mm = np.std(scales_mm)
         consistency = std_scale_mm / mean_scale_mm if mean_scale_mm > 0 else 1.0
+        confidence = max(0, min(100, 100 * (1 - consistency)))
     else:
-        consistency = 0.0
-    avg_distance = np.mean([m['match_distance'] for m in matches])
-    confidence = calculate_confidence(len(matches), consistency, avg_distance, threshold)
+        confidence = 50.0  # Single sample
+    
+    # Adjust confidence based on sample size
+    sample_factor = min(1.0, len(matches) / 5.0)
+    confidence = confidence * sample_factor
+    
     points_per_cm = mean_scale_mm * 10
     points_per_m = mean_scale_mm * 1000
+    
     return ScaleResult(
         points_per_cm=round(points_per_cm, 4),
         cm_per_point=round(1 / points_per_cm, 4) if points_per_cm > 0 else 0.0,
@@ -355,111 +294,151 @@ def calculate_scale_stats(matches: List[Dict], threshold: float) -> ScaleResult:
         samples=len(matches)
     )
 
-@app.post("/extract-scale/", response_model=OutputData)
-async def extract_scale(file: UploadFile = File(...)):
-    """Extract scale from a JSON file containing vector data and dimension texts"""
-    try:
-        # Read and parse the uploaded JSON file
-        contents = await file.read()
-        
-        try:
-            input_data = json.loads(contents.decode('utf-8'))
-            logger.info(f"Successfully parsed JSON input")
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid JSON format: {str(e)}"
+def calculate_region_scale(region: RegionData) -> RegionScaleResult:
+    """Calculate scale for a single region"""
+    logger.info(f"Processing region: {region.label}")
+    
+    # Match dimensions for horizontal lines
+    horiz_matches, horiz_checked = match_dimensions_in_region(region, "horizontal")
+    horiz_filtered = filter_outliers(horiz_matches)
+    
+    # Match dimensions for vertical lines
+    vert_matches, vert_checked = match_dimensions_in_region(region, "vertical")
+    vert_filtered = filter_outliers(vert_matches)
+    
+    # Calculate scale statistics
+    horizontal_scale = calculate_scale_stats(horiz_filtered)
+    vertical_scale = calculate_scale_stats(vert_filtered)
+    
+    # Calculate average scale
+    all_filtered = horiz_filtered + vert_filtered
+    
+    if all_filtered:
+        # Weighted average based on sample count
+        total_samples = horizontal_scale.samples + vertical_scale.samples
+        if total_samples > 0:
+            horiz_weight = horizontal_scale.samples / total_samples
+            vert_weight = vertical_scale.samples / total_samples
+            
+            avg_points_per_cm = (
+                horizontal_scale.points_per_cm * horiz_weight +
+                vertical_scale.points_per_cm * vert_weight
             )
-        
-        # Validate input data
-        if not input_data.get('vector_data') and not input_data.get('texts'):
-            logger.warning("Input missing both vector_data and texts")
-            raise HTTPException(
-                status_code=400,
-                detail="Input must include both vector_data and texts"
+            avg_confidence = (
+                horizontal_scale.confidence * horiz_weight +
+                vertical_scale.confidence * vert_weight
             )
             
-        # Print received data for debugging
-        logger.info(f"Received data with {len(input_data.get('vector_data', []))} vectors and {len(input_data.get('texts', []))} texts")
-        
-        # If empty arrays were provided, return a default response
-        if len(input_data.get('vector_data', [])) == 0:
-            logger.warning("No vector data provided")
-            raise HTTPException(
-                status_code=400,
-                detail="No vector data provided. Input must include lines or curves with p1 and p2 points."
+            average_scale = ScaleResult(
+                points_per_cm=round(avg_points_per_cm, 4),
+                cm_per_point=round(1 / avg_points_per_cm, 4) if avg_points_per_cm > 0 else 0.0,
+                points_per_m=round(avg_points_per_cm * 100, 4),
+                m_per_point=round(1 / (avg_points_per_cm * 100), 6) if avg_points_per_cm > 0 else 0.0,
+                confidence=round(avg_confidence, 1),
+                samples=total_samples
             )
-        
-        if len(input_data.get('texts', [])) == 0:
-            logger.warning("No text data provided")
-            raise HTTPException(
-                status_code=400,
-                detail="No text data provided. Input must include dimension texts."
-            )
-        
-        # Convert to Pydantic model for validation
-        try:
-            data = InputData(**input_data)
-            logger.info(f"Data validated: {len(data.vector_data)} vectors and {len(data.texts)} texts")
-        except Exception as e:
-            logger.error(f"Data validation error: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid data structure: {str(e)}"
-            )
-        
-        # Process horizontal lines
-        horiz_matches, horiz_checked = match_dimensions_to_lines(
-            data.vector_data, data.texts, "horizontal"
+        else:
+            average_scale = calculate_scale_stats(all_filtered)
+    else:
+        average_scale = ScaleResult(
+            points_per_cm=0.0,
+            cm_per_point=0.0,
+            points_per_m=0.0,
+            m_per_point=0.0,
+            confidence=0.0,
+            samples=0
         )
-        horiz_filtered = filter_outliers(horiz_matches)
+    
+    # Prepare matched dimensions for output
+    matched_dimensions = []
+    for m in all_filtered:
+        matched_dimensions.append(DimensionMatch(
+            line=MatchedLine(
+                p1={"x": m['line'].p1.x, "y": m['line'].p1.y},
+                p2={"x": m['line'].p2.x, "y": m['line'].p2.y},
+                length=m['line'].length,
+                orientation=m['line'].orientation
+            ),
+            text=MatchedText(
+                value=m['text'].text,
+                position={"x": m['text'].position.x, "y": m['text'].position.y}
+            ),
+            dimension=m['dimension'],
+            match_distance=round(m['match_distance'], 2),
+            points_per_mm=round(m['points_per_mm'], 4)
+        ))
+    
+    # Build scale dictionary
+    scale_dict = {}
+    if horizontal_scale.samples > 0:
+        scale_dict["horizontal"] = horizontal_scale
+    if vertical_scale.samples > 0:
+        scale_dict["vertical"] = vertical_scale
+    
+    return RegionScaleResult(
+        region_label=region.label,
+        scale=scale_dict,
+        average=average_scale,
+        valid_pairs_used=len(all_filtered),
+        total_matches_checked=horiz_checked + vert_checked,
+        matched_dimensions=matched_dimensions
+    )
+
+@app.post("/calculate-region-scales/", response_model=ScaleOutput)
+async def calculate_region_scales(input_data: FilteredInput):
+    """Calculate scale for each region from filtered data"""
+    try:
+        logger.info(f"Processing {input_data.drawing_type} with {len(input_data.regions)} regions")
         
-        # Process vertical lines
-        vert_matches, vert_checked = match_dimensions_to_lines(
-            data.vector_data, data.texts, "vertical"
-        )
-        vert_filtered = filter_outliers(vert_matches)
+        region_results = []
+        all_valid_pairs = 0
         
-        # Calculate scale statistics
-        avg_line_length = np.mean([
-            v.length if v.length else calculate_line_length(v.p1, v.p2)
-            for v in data.vector_data
-        ])
-        threshold = max(MIN_DISTANCE_THRESHOLD, avg_line_length * DISTANCE_THRESHOLD_FACTOR)
+        # Process each region
+        for region in input_data.regions:
+            logger.info(f"Region {region.label}: {len(region.lines)} lines, {len(region.texts)} texts")
+            
+            if not region.lines or not region.texts:
+                logger.warning(f"Skipping region {region.label} - no lines or texts")
+                continue
+            
+            region_result = calculate_region_scale(region)
+            region_results.append(region_result)
+            all_valid_pairs += region_result.valid_pairs_used
         
-        horizontal_scale = calculate_scale_stats(horiz_filtered, threshold)
-        vertical_scale = calculate_scale_stats(vert_filtered, threshold)
-        
-        # Calculate average scale
-        all_filtered = horiz_filtered + vert_filtered
-        if all_filtered:
-            total_samples = horizontal_scale.samples + vertical_scale.samples
+        # Calculate overall average
+        if region_results:
+            total_samples = sum(r.average.samples for r in region_results)
             if total_samples > 0:
-                horiz_weight = horizontal_scale.samples / total_samples
-                vert_weight = vertical_scale.samples / total_samples
-                avg_points_per_cm = (
-                    horizontal_scale.points_per_cm * horiz_weight +
-                    vertical_scale.points_per_cm * vert_weight
-                )
-                avg_confidence = (
-                    horizontal_scale.confidence * horiz_weight +
-                    vertical_scale.confidence * vert_weight
-                )
-                average_scale = ScaleResult(
-                    points_per_cm=round(avg_points_per_cm, 4),
-                    cm_per_point=round(1 / avg_points_per_cm, 4) if avg_points_per_cm > 0 else 0.0,
-                    points_per_m=round(avg_points_per_cm * 100, 4),
-                    m_per_point=round(1 / (avg_points_per_cm * 100), 6) if avg_points_per_cm > 0 else 0.0,
-                    confidence=round(avg_confidence, 1),
+                # Weighted average across all regions
+                weighted_points_per_cm = sum(
+                    r.average.points_per_cm * r.average.samples 
+                    for r in region_results
+                ) / total_samples
+                
+                weighted_confidence = sum(
+                    r.average.confidence * r.average.samples 
+                    for r in region_results
+                ) / total_samples
+                
+                overall_average = ScaleResult(
+                    points_per_cm=round(weighted_points_per_cm, 4),
+                    cm_per_point=round(1 / weighted_points_per_cm, 4) if weighted_points_per_cm > 0 else 0.0,
+                    points_per_m=round(weighted_points_per_cm * 100, 4),
+                    m_per_point=round(1 / (weighted_points_per_cm * 100), 6) if weighted_points_per_cm > 0 else 0.0,
+                    confidence=round(weighted_confidence, 1),
                     samples=total_samples
                 )
             else:
-                average_scale = calculate_scale_stats(all_filtered, threshold)
+                overall_average = ScaleResult(
+                    points_per_cm=0.0,
+                    cm_per_point=0.0,
+                    points_per_m=0.0,
+                    m_per_point=0.0,
+                    confidence=0.0,
+                    samples=0
+                )
         else:
-            logger.warning("No valid dimension-line matches found")
-            # Return a default response instead of failing
-            average_scale = ScaleResult(
+            overall_average = ScaleResult(
                 points_per_cm=0.0,
                 cm_per_point=0.0,
                 points_per_m=0.0,
@@ -468,49 +447,19 @@ async def extract_scale(file: UploadFile = File(...)):
                 samples=0
             )
         
-        # Prepare matched dimensions for output
-        matched_dimensions = []
-        for m in all_filtered:
-            matched_dimensions.append(DimensionMatch(
-                line=MatchedLine(
-                    p1={"x": m['line'].p1.x, "y": m['line'].p1.y},
-                    p2={"x": m['line'].p2.x, "y": m['line'].p2.y},
-                    length=m['line'].length,
-                    orientation=m['line'].orientation
-                ),
-                text=MatchedText(
-                    value=m['text'].text,
-                    position={"x": m['text'].position.x, "y": m['text'].position.y}
-                ),
-                dimension=m['dimension'],
-                match_distance=round(m['match_distance'], 2)
-            ))
-        
         # Build response
-        scale_dict = {}
-        if horizontal_scale.samples > 0:
-            scale_dict["horizontal"] = horizontal_scale
-        if vertical_scale.samples > 0:
-            scale_dict["vertical"] = vertical_scale
-        
-        response = OutputData(
-            scale=scale_dict,
-            average=average_scale,
-            unit="cm",
-            valid_pairs_used=len(all_filtered),
-            total_matches_checked=horiz_checked + vert_checked,
-            matched_dimensions=matched_dimensions
+        response = ScaleOutput(
+            drawing_type=input_data.drawing_type,
+            regions=region_results,
+            overall_average=overall_average,
+            total_valid_pairs=all_valid_pairs
         )
         
-        logger.info(
-            f"Scale calculation completed: {response.valid_pairs_used} valid pairs "
-            f"from {response.total_matches_checked} checks"
-        )
+        logger.info(f"Scale calculation completed: {all_valid_pairs} total valid pairs")
+        logger.info(f"Overall scale: {overall_average.points_per_cm:.2f} pt/cm (confidence: {overall_average.confidence:.1f}%)")
         
         return response
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error during scale calculation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -519,14 +468,26 @@ async def extract_scale(file: UploadFile = File(...)):
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Optimized Scale Calculation API",
-        "version": "2.0.0",
-        "description": "Calculates precise scale from CAD vector data and dimension texts",
+        "title": "Region-Based Scale Calculation API",
+        "version": "1.0.0",
+        "description": "Calculates scale per region from filtered vector data",
         "endpoints": {
             "/": "This page",
-            "/extract-scale/": "POST - Calculate scale from vector data and texts JSON file",
+            "/calculate-region-scales/": "POST - Calculate scale for each region",
             "/health/": "GET - Health check"
-        }
+        },
+        "workflow": [
+            "1. Receives filtered data with regions containing lines and texts",
+            "2. For each region, matches dimension texts to nearest lines",
+            "3. Calculates scale by dividing line length by dimension value",
+            "4. Returns scale per region and overall average"
+        ],
+        "matching_logic": [
+            "Uses line midpoint to find nearest dimension text",
+            "Calculates perpendicular distance from text to line",
+            "Matches within threshold (10% of average line length)",
+            "Filters outliers using z-score method"
+        ]
     }
 
 @app.get("/health/")
@@ -535,11 +496,11 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.0.0",
+        "version": "1.0.0",
         "port": PORT
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Scale API on port {PORT}")
+    logger.info(f"Starting Region-Based Scale API on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
