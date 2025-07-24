@@ -6,17 +6,17 @@ import multiprocessing
 bind = f"0.0.0.0:{os.environ.get('PORT', 10000)}"
 backlog = 2048
 
-# Worker processes - optimized for CPU-bound scale calculations
-workers = min(multiprocessing.cpu_count() + 1, 4)  # Cap at 4 workers
+# Worker processes
+workers = min(multiprocessing.cpu_count() + 1, 4)
 worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
 
 # Timeout settings
-timeout = 300  # 5 minutes for complex calculations
-graceful_timeout = 60
+timeout = 120  # 2 minutes for scale calculations
+graceful_timeout = 30
 keepalive = 5
 
-# Restart workers periodically to prevent memory bloat
+# Restart workers periodically
 max_requests = 1000
 max_requests_jitter = 100
 
@@ -40,7 +40,3 @@ worker_tmp_dir = "/dev/shm"
 
 # Preload app for better performance
 preload_app = True
-
-# Stats
-statsd_host = None
-statsd_prefix = "scale_api"
