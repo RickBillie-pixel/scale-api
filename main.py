@@ -23,7 +23,7 @@ SCALE_TOLERANCE = 0.1  # 10% tolerance for horizontal/vertical scale comparison
 
 # Drawing type specific scale ranges (pt/mm)
 SCALE_RANGES = {
-    "plattegrond": {"min": 0.25, "max": 0.50},
+    "plattegrond": {"min": 0.15, "max": 0.30},
     "gevelaanzicht": {"min": 0.20, "max": 0.60},
     "detailtekening": {"min": 0.10, "max": 2.00},
     "doorsnede": {"min": 0.20, "max": 0.60},
