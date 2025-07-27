@@ -23,21 +23,21 @@ SCALE_TOLERANCE = 0.1  # 10% tolerance for horizontal/vertical scale comparison
 
 # Drawing type specific scale ranges (pt/mm)
 SCALE_RANGES = {
-    "plattegrond": {"min": 0.15, "max": 0.30},
-    "gevelaanzicht": {"min": 0.20, "max": 0.60},
-    "detailtekening": {"min": 0.10, "max": 2.00},
-    "doorsnede": {"min": 0.20, "max": 0.60},
-    "bestektekening": {"min": 0.20, "max": 0.80},
+    "plattegrond": {"min": 0.10, "max": 0.25},
+    "gevelaanzicht": {"min": 0.15, "max": 0.35},
+    "detailtekening": {"min": 0.20, "max": 1.00},
+    "doorsnede": {"min": 0.15, "max": 0.35},
+    "bestektekening": {"min": 0.10, "max": 0.30},
     "installatietekening": {"min": 0.15, "max": 0.60}
 }
 
 # Default scales per drawing type (pt/mm)
 DEFAULT_SCALES = {
-    "plattegrond": 0.35,
-    "gevelaanzicht": 0.40,
+    "plattegrond": 0.15,
+    "gevelaanzicht": 0.20,
     "detailtekening": 0.50,
-    "doorsnede": 0.40,
-    "bestektekening": 0.35,
+    "doorsnede": 0.20,
+    "bestektekening": 0.15,
     "installatietekening": 0.30
 }
 
