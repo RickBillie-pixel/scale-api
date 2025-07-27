@@ -120,18 +120,36 @@ def find_top_dimensions_all_orientations(texts: List[FilteredText], limit: int =
     valid_dimensions.sort(key=lambda x: x[3], reverse=True)
     return valid_dimensions[:limit]
 
-def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: List[FilteredLine], threshold: float = 30.0) -> Optional[Tuple[FilteredLine, str]]:
-    """Find the closest line regardless of orientation. Returns (line, line_orientation)"""
+def calculate_distance_to_line(text_midpoint: Dict[str, float], line: FilteredLine) -> float:
+    """Calculate shortest distance from text to line based on line orientation"""
+    
+    text_x = text_midpoint["x"]
+    text_y = text_midpoint["y"]
+    line_x = line.midpoint.x
+    line_y = line.midpoint.y
+    
+    if line.orientation == "horizontal":
+        # For horizontal lines, distance is vertical separation
+        return abs(text_y - line_y)
+    elif line.orientation == "vertical":
+        # For vertical lines, distance is horizontal separation  
+        return abs(text_x - line_x)
+    else:
+        # For diagonal lines, use euclidean distance (fallback)
+        return math.sqrt((text_x - line_x)**2 + (text_y - line_y)**2)
+
+def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: List[FilteredLine], threshold: float = 100.0) -> Optional[Tuple[FilteredLine, str]]:
+    """Find the closest line regardless of orientation using proper distance calculation"""
     closest_line = None
     closest_orientation = None
     min_distance = float('inf')
     
     for line in lines:
         # Filter out very short lines for large dimensions
-        if line.length < 200:  # Increased from 50 to 200pt
+        if line.length < 100:  # Lowered from 200 to 100pt
             continue
         
-        distance = calculate_distance(text_midpoint, line.midpoint)
+        distance = calculate_distance_to_line(text_midpoint, line)  # ← UPDATED: Use line-specific distance
         
         if distance <= threshold and distance < min_distance:
             min_distance = distance
@@ -144,9 +162,9 @@ def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: Li
             if line.length < 100:  # Still filter very short lines
                 continue
             
-            distance = calculate_distance(text_midpoint, line.midpoint)
+            distance = calculate_distance_to_line(text_midpoint, line)  # ← UPDATED: Use line-specific distance
             
-            if distance <= 50 and distance < min_distance:  # Max 50pt distance
+            if distance <= 150 and distance < min_distance:  # Max 150pt distance
                 min_distance = distance
                 closest_line = line
                 closest_orientation = line.orientation
@@ -171,7 +189,7 @@ def process_region(region: RegionData) -> RegionScaleResult:
         line_result = find_closest_line_any_orientation(text.midpoint, region.lines)
         if line_result:
             closest_line, line_orientation = line_result
-            distance = calculate_distance(text.midpoint, closest_line.midpoint)
+            distance = calculate_distance_to_line(text.midpoint, closest_line)
             scale_pt_per_mm = closest_line.length / value_mm
             scale_mm_per_pt = 1 / scale_pt_per_mm
             
