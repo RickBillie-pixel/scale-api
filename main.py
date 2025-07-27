@@ -120,14 +120,15 @@ def find_top_dimensions_all_orientations(texts: List[FilteredText], limit: int =
     valid_dimensions.sort(key=lambda x: x[3], reverse=True)
     return valid_dimensions[:limit]
 
-def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: List[FilteredLine], threshold: float = 100.0) -> Optional[Tuple[FilteredLine, str]]:
+def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: List[FilteredLine], threshold: float = 30.0) -> Optional[Tuple[FilteredLine, str]]:
     """Find the closest line regardless of orientation. Returns (line, line_orientation)"""
     closest_line = None
     closest_orientation = None
     min_distance = float('inf')
     
     for line in lines:
-        if line.length < 50:  # Skip very short lines
+        # Filter out very short lines for large dimensions
+        if line.length < 200:  # Increased from 50 to 200pt
             continue
         
         distance = calculate_distance(text_midpoint, line.midpoint)
@@ -137,15 +138,15 @@ def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: Li
             closest_line = line
             closest_orientation = line.orientation
     
-    # If no line found within threshold, find the absolute closest line
+    # If no line found within threshold, try with lower minimum length
     if closest_line is None:
         for line in lines:
-            if line.length < 50:  # Skip very short lines
+            if line.length < 100:  # Still filter very short lines
                 continue
             
             distance = calculate_distance(text_midpoint, line.midpoint)
             
-            if distance < min_distance:
+            if distance <= 50 and distance < min_distance:  # Max 50pt distance
                 min_distance = distance
                 closest_line = line
                 closest_orientation = line.orientation
