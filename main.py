@@ -106,14 +106,11 @@ def extract_dimension_mm(text: str) -> Optional[Tuple[float, str, float]]:
     except (ValueError, IndexError):
         return None
 
-def find_top_dimensions(texts: List[FilteredText], orientation: str, limit: int = 3) -> List[Tuple[FilteredText, float, str, float]]:
-    """Find top N dimension values for given orientation. Returns (text, value, unit, value_mm)"""
+def find_top_dimensions_all_orientations(texts: List[FilteredText], limit: int = 3) -> List[Tuple[FilteredText, float, str, float]]:
+    """Find top N dimension values regardless of text orientation. Returns (text, value, unit, value_mm)"""
     valid_dimensions = []
     
     for text in texts:
-        if text.orientation != orientation:
-            continue
-        
         dim_result = extract_dimension_mm(text.text)
         if dim_result:
             value, unit, value_mm = dim_result
@@ -123,37 +120,43 @@ def find_top_dimensions(texts: List[FilteredText], orientation: str, limit: int 
     valid_dimensions.sort(key=lambda x: x[3], reverse=True)
     return valid_dimensions[:limit]
 
-def find_closest_line(text_midpoint: Dict[str, float], lines: List[FilteredLine], orientation: str) -> Optional[FilteredLine]:
-    """Find the closest line with same orientation"""
+def find_closest_line_any_orientation(text_midpoint: Dict[str, float], lines: List[FilteredLine], threshold: float = 8.0) -> Optional[Tuple[FilteredLine, str]]:
+    """Find the closest line regardless of orientation. Returns (line, line_orientation)"""
     closest_line = None
+    closest_orientation = None
     min_distance = float('inf')
     
     for line in lines:
-        if line.orientation != orientation:
-            continue
-        
         if line.length < 50:  # Skip very short lines
             continue
         
         distance = calculate_distance(text_midpoint, line.midpoint)
         
-        if distance < min_distance:
+        if distance <= threshold and distance < min_distance:
             min_distance = distance
             closest_line = line
+            closest_orientation = line.orientation
     
-    return closest_line
+    if closest_line:
+        return (closest_line, closest_orientation)
+    return None
 
 def process_region(region: RegionData) -> RegionScaleResult:
-    """Process a single region - find top 3 dimensions per orientation and calculate scales"""
+    """Process a single region - find top dimensions and match to closest lines"""
     result = RegionScaleResult(region_label=region.label)
     
     all_scales = []
     
-    # Process horizontal dimensions (top 3)
-    horizontal_dims = find_top_dimensions(region.texts, "horizontal", 3)
-    for text, value, unit, value_mm in horizontal_dims:
-        closest_line = find_closest_line(text.midpoint, region.lines, "horizontal")
-        if closest_line:
+    # Get top dimensions regardless of text orientation
+    top_dimensions = find_top_dimensions_all_orientations(region.texts, 6)  # Get top 6 to have enough for both orientations
+    
+    horizontal_calcs = []
+    vertical_calcs = []
+    
+    for text, value, unit, value_mm in top_dimensions:
+        line_result = find_closest_line_any_orientation(text.midpoint, region.lines)
+        if line_result:
+            closest_line, line_orientation = line_result
             distance = calculate_distance(text.midpoint, closest_line.midpoint)
             scale_pt_per_mm = closest_line.length / value_mm
             scale_mm_per_pt = 1 / scale_pt_per_mm
@@ -170,32 +173,18 @@ def process_region(region: RegionData) -> RegionScaleResult:
                 scale_pt_per_mm=round(scale_pt_per_mm, 4),
                 scale_mm_per_pt=round(scale_mm_per_pt, 4)
             )
-            result.horizontal.append(calc)
+            
+            # Group by actual line orientation (not text orientation)
+            if line_orientation == "horizontal":
+                horizontal_calcs.append(calc)
+            elif line_orientation == "vertical":
+                vertical_calcs.append(calc)
+            
             all_scales.append(scale_pt_per_mm)
     
-    # Process vertical dimensions (top 3)
-    vertical_dims = find_top_dimensions(region.texts, "vertical", 3)
-    for text, value, unit, value_mm in vertical_dims:
-        closest_line = find_closest_line(text.midpoint, region.lines, "vertical")
-        if closest_line:
-            distance = calculate_distance(text.midpoint, closest_line.midpoint)
-            scale_pt_per_mm = closest_line.length / value_mm
-            scale_mm_per_pt = 1 / scale_pt_per_mm
-            
-            calc = DimensionCalculation(
-                dimension_text=text.text,
-                dimension_value=value,
-                dimension_unit=unit,
-                dimension_mm=value_mm,
-                line_length_pt=closest_line.length,
-                line_midpoint={"x": closest_line.midpoint.x, "y": closest_line.midpoint.y},
-                text_midpoint=text.midpoint,
-                distance_text_to_line=round(distance, 2),
-                scale_pt_per_mm=round(scale_pt_per_mm, 4),
-                scale_mm_per_pt=round(scale_mm_per_pt, 4)
-            )
-            result.vertical.append(calc)
-            all_scales.append(scale_pt_per_mm)
+    # Take top 3 for each orientation
+    result.horizontal = horizontal_calcs[:3]
+    result.vertical = vertical_calcs[:3]
     
     # Calculate average scale from all calculations
     if all_scales:
