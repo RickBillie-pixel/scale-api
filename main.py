@@ -2,11 +2,12 @@ import os
 import re
 import math
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -17,11 +18,12 @@ logger = logging.getLogger(__name__)
 
 # Constants
 PORT = int(os.environ.get("PORT", 10000))
+DISTANCE_THRESHOLD = 10.0  # Max distance in points for matching
 
 app = FastAPI(
-    title="Scale Calculation API - Simplified",
-    description="Calculates scale (px/mm) per region using highest dimensions only",
-    version="3.0.0"
+    title="Scale Calculation API",
+    description="Calculates scale (pt/mm) per region from filtered vector data",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -33,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input Models
+# Input Models - matching Filter API output format
 class CleanPoint(BaseModel):
     x: float
     y: float
@@ -58,14 +60,36 @@ class FilteredInput(BaseModel):
     regions: List[RegionData]
 
 # Output Models
+class DimensionData(BaseModel):
+    value: float
+    unit: str
+    value_mm: float
+    text: str
+
+class LineMatch(BaseModel):
+    line: FilteredLine
+    distance: float
+
+class ScaleMatch(BaseModel):
+    dimension: DimensionData
+    line_match: LineMatch
+    scale_pt_per_mm: float
+    scale_mm_per_pt: float
+
 class RegionScaleResult(BaseModel):
-    region_id: str
-    horizontal: Optional[Dict[str, Any]] = None
-    vertical: Optional[Dict[str, Any]] = None
+    region_label: str
+    horizontal: Optional[ScaleMatch] = None
+    vertical: Optional[ScaleMatch] = None
+    scales_match: bool
+    scale_ratio: Optional[float] = None
+    average_scale_pt_per_mm: Optional[float] = None
+    average_scale_mm_per_pt: Optional[float] = None
 
 class ScaleOutput(BaseModel):
     drawing_type: str
     regions: List[RegionScaleResult]
+    overall_average_pt_per_mm: Optional[float] = None
+    overall_average_mm_per_pt: Optional[float] = None
     timestamp: str
 
 # Utility functions
@@ -73,11 +97,11 @@ def calculate_distance(p1: Dict[str, float], p2: CleanPoint) -> float:
     """Calculate Euclidean distance between two points"""
     return math.sqrt((p2.x - p1["x"])**2 + (p2.y - p1["y"])**2)
 
-def extract_dimension_mm(text: str) -> Optional[float]:
-    """Extract dimension value and convert to mm"""
+def extract_dimension(text: str) -> Optional[DimensionData]:
+    """Extract dimension value and unit from text"""
     text = text.strip()
     
-    # Pattern for valid dimensions: numbers with optional units
+    # Pattern for valid dimensions: pure numbers with optional units
     pattern = r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$'
     match = re.match(pattern, text)
     
@@ -89,6 +113,10 @@ def extract_dimension_mm(text: str) -> Optional[float]:
         value = float(value_str)
         unit = match.group(2) if match.group(2) else 'mm'
         
+        # Skip very small values
+        if value < 100 and unit == 'mm':
+            return None
+        
         # Convert to mm
         conversions = {
             'mm': 1.0,
@@ -97,104 +125,171 @@ def extract_dimension_mm(text: str) -> Optional[float]:
         }
         value_mm = value * conversions.get(unit, 1.0)
         
-        return value_mm
+        # Skip dimensions less than 100mm
+        if value_mm < 100:
+            return None
         
+        return DimensionData(
+            value=value,
+            unit=unit,
+            value_mm=value_mm,
+            text=text
+        )
     except (ValueError, IndexError):
         return None
 
-def find_highest_dimension(texts: List[FilteredText], orientation: str) -> Optional[FilteredText]:
-    """Find the text with highest dimension value for given orientation"""
+def find_highest_dimension(texts: List[FilteredText], orientation: str) -> Optional[Tuple[FilteredText, DimensionData]]:
+    """Find the highest dimension value for a given orientation"""
     highest_value = 0
     highest_text = None
+    highest_dim = None
     
     for text in texts:
         if text.orientation != orientation:
             continue
         
-        dim_value = extract_dimension_mm(text.text)
-        if dim_value and dim_value > highest_value:
-            highest_value = dim_value
+        dim = extract_dimension(text.text)
+        if dim and dim.value_mm > highest_value:
+            highest_value = dim.value_mm
             highest_text = text
+            highest_dim = dim
     
-    return highest_text
+    return (highest_text, highest_dim) if highest_text else None
 
-def find_closest_line(
-    text_midpoint: Dict[str, float],
+def find_nearest_line(
+    dimension_midpoint: Dict[str, float],
     lines: List[FilteredLine],
-    orientation: str
-) -> Optional[FilteredLine]:
-    """Find the closest line with same orientation"""
-    closest_line = None
+    orientation: str,
+    threshold: Optional[float] = DISTANCE_THRESHOLD
+) -> Optional[LineMatch]:
+    """Find the nearest line with same orientation"""
+    nearest_line = None
     min_distance = float('inf')
     
     for line in lines:
         if line.orientation != orientation:
             continue
         
-        distance = calculate_distance(text_midpoint, line.midpoint)
+        # Skip very short lines
+        if line.length < 50:
+            continue
         
-        if distance < min_distance:
-            min_distance = distance
-            closest_line = line
+        distance = calculate_distance(dimension_midpoint, line.midpoint)
+        
+        if threshold is None or distance <= threshold:
+            if distance < min_distance:
+                min_distance = distance
+                nearest_line = line
     
-    return closest_line
+    if nearest_line:
+        return LineMatch(line=nearest_line, distance=min_distance)
+    
+    return None
 
-def process_region(region: RegionData) -> RegionScaleResult:
-    """Process a single region - find highest dimensions and calculate scales"""
+
+
+def process_region(region: RegionData, drawing_type: str) -> RegionScaleResult:
+    """Process a single region to calculate scales"""
     logger.info(f"Processing region: {region.label}")
     
-    result = RegionScaleResult(region_id=region.label)
+    result = RegionScaleResult(
+        region_label=region.label,
+        scales_match=False
+    )
     
-    # Process horizontal dimension
-    horizontal_text = find_highest_dimension(region.texts, "horizontal")
-    if horizontal_text:
-        horizontal_line = find_closest_line(horizontal_text.midpoint, region.lines, "horizontal")
-        if horizontal_line:
-            dimension_mm = extract_dimension_mm(horizontal_text.text)
-            if dimension_mm:
-                scale_px_per_mm = horizontal_line.length / dimension_mm
-                
-                result.horizontal = {
-                    "orientation": "horizontal",
-                    "dimension_text": horizontal_text.text,
-                    "dimension_mm": dimension_mm,
-                    "line_length_px": horizontal_line.length,
-                    "scale_px_per_mm": round(scale_px_per_mm, 4),
-                    "distance_to_line": round(calculate_distance(horizontal_text.midpoint, horizontal_line.midpoint), 2)
-                }
-                
-                logger.info(f"  Horizontal: {horizontal_text.text} = {dimension_mm}mm, line = {horizontal_line.length}px, scale = {scale_px_per_mm:.4f} px/mm")
+    # Find highest horizontal dimension
+    horizontal_result = find_highest_dimension(region.texts, "horizontal")
+    if horizontal_result:
+        h_text, h_dim = horizontal_result
+        logger.info(f"  Highest horizontal dimension: {h_dim.text} = {h_dim.value_mm}mm")
+        
+        # Find nearest horizontal line
+        h_match = find_nearest_line(h_text.midpoint, region.lines, "horizontal")
+        if not h_match:
+            # Fallback: find nearest without threshold
+            h_match = find_nearest_line(h_text.midpoint, region.lines, "horizontal", threshold=None)
+        
+        if h_match:
+            scale_mm_per_pt = h_dim.value_mm / h_match.line.length
+            scale_pt_per_mm = 1 / scale_mm_per_pt
+            
+            result.horizontal = ScaleMatch(
+                dimension=h_dim,
+                line_match=h_match,
+                scale_pt_per_mm=round(scale_pt_per_mm, 4),
+                scale_mm_per_pt=round(scale_mm_per_pt, 4)
+            )
+            
+            logger.info(f"    Matched to line: {h_match.line.length:.1f}pt, distance: {h_match.distance:.1f}pt")
+            logger.info(f"    Scale: {scale_pt_per_mm:.4f} pt/mm")
     
-    # Process vertical dimension
-    vertical_text = find_highest_dimension(region.texts, "vertical")
-    if vertical_text:
-        vertical_line = find_closest_line(vertical_text.midpoint, region.lines, "vertical")
-        if vertical_line:
-            dimension_mm = extract_dimension_mm(vertical_text.text)
-            if dimension_mm:
-                scale_px_per_mm = vertical_line.length / dimension_mm
-                
-                result.vertical = {
-                    "orientation": "vertical",
-                    "dimension_text": vertical_text.text,
-                    "dimension_mm": dimension_mm,
-                    "line_length_px": vertical_line.length,
-                    "scale_px_per_mm": round(scale_px_per_mm, 4),
-                    "distance_to_line": round(calculate_distance(vertical_text.midpoint, vertical_line.midpoint), 2)
-                }
-                
-                logger.info(f"  Vertical: {vertical_text.text} = {dimension_mm}mm, line = {vertical_line.length}px, scale = {scale_px_per_mm:.4f} px/mm")
+    # Find highest vertical dimension
+    vertical_result = find_highest_dimension(region.texts, "vertical")
+    if vertical_result:
+        v_text, v_dim = vertical_result
+        logger.info(f"  Highest vertical dimension: {v_dim.text} = {v_dim.value_mm}mm")
+        
+        # Find nearest vertical line
+        v_match = find_nearest_line(v_text.midpoint, region.lines, "vertical")
+        if not v_match:
+            # Fallback: find nearest without threshold
+            v_match = find_nearest_line(v_text.midpoint, region.lines, "vertical", threshold=None)
+        
+        if v_match:
+            scale_mm_per_pt = v_dim.value_mm / v_match.line.length
+            scale_pt_per_mm = 1 / scale_mm_per_pt
+            
+            result.vertical = ScaleMatch(
+                dimension=v_dim,
+                line_match=v_match,
+                scale_pt_per_mm=round(scale_pt_per_mm, 4),
+                scale_mm_per_pt=round(scale_mm_per_pt, 4)
+            )
+            
+            logger.info(f"    Matched to line: {v_match.line.length:.1f}pt, distance: {v_match.distance:.1f}pt")
+            logger.info(f"    Scale: {scale_pt_per_mm:.4f} pt/mm")
+    
+    # Compare scales and calculate average
+    if result.horizontal and result.vertical:
+        h_scale = result.horizontal.scale_pt_per_mm
+        v_scale = result.vertical.scale_pt_per_mm
+        
+        # Calculate ratio
+        ratio = h_scale / v_scale if v_scale > 0 else 0
+        result.scale_ratio = round(ratio, 3)
+        
+        # Check if scales match (within tolerance)
+        result.scales_match = 0.9 <= ratio <= 1.1
+        
+        # Calculate average
+        result.average_scale_pt_per_mm = round((h_scale + v_scale) / 2, 4)
+        result.average_scale_mm_per_pt = round(1 / result.average_scale_pt_per_mm, 4)
+        
+        logger.info(f"  Scale match: {result.scales_match} (ratio: {ratio:.3f})")
+        logger.info(f"  Average scale: {result.average_scale_pt_per_mm:.4f} pt/mm")
+        
+    elif result.horizontal:
+        # Only horizontal scale available
+        result.average_scale_pt_per_mm = result.horizontal.scale_pt_per_mm
+        result.average_scale_mm_per_pt = result.horizontal.scale_mm_per_pt
+        
+    elif result.vertical:
+        # Only vertical scale available
+        result.average_scale_pt_per_mm = result.vertical.scale_pt_per_mm
+        result.average_scale_mm_per_pt = result.vertical.scale_mm_per_pt
     
     return result
 
 @app.post("/calculate-scale/", response_model=ScaleOutput)
-async def calculate_scale(input_data: FilteredInput):
-    """Calculate scale for each region using highest dimensions only"""
+async def calculate_scale(input_data: FilteredInput, debug: bool = Query(False)):
+    """Calculate scale for each region from filtered data"""
     try:
         logger.info(f"=== Scale Calculation Start ===")
         logger.info(f"Processing {input_data.drawing_type} with {len(input_data.regions)} regions")
+        logger.info(f"Debug mode: {debug}")
         
         region_results = []
+        valid_scales = []
         
         # Process each region
         for region in input_data.regions:
@@ -204,18 +299,35 @@ async def calculate_scale(input_data: FilteredInput):
                 logger.warning(f"Skipping region {region.label} - no lines or texts")
                 continue
             
-            region_result = process_region(region)
+            region_result = process_region(region, input_data.drawing_type)
             region_results.append(region_result)
+            
+            # Collect valid scales for overall average
+            if region_result.average_scale_pt_per_mm:
+                valid_scales.append(region_result.average_scale_pt_per_mm)
+        
+        # Calculate overall average
+        if valid_scales:
+            overall_avg_pt_per_mm = round(np.mean(valid_scales), 4)
+            overall_avg_mm_per_pt = round(1 / overall_avg_pt_per_mm, 4)
+        else:
+            overall_avg_pt_per_mm = None
+            overall_avg_mm_per_pt = None
+            logger.warning(f"No scales found")
         
         # Build response
         response = ScaleOutput(
             drawing_type=input_data.drawing_type,
             regions=region_results,
+            overall_average_pt_per_mm=overall_avg_pt_per_mm,
+            overall_average_mm_per_pt=overall_avg_mm_per_pt,
             timestamp=datetime.now().isoformat()
         )
         
         logger.info(f"\n=== Scale Calculation Complete ===")
-        logger.info(f"Processed {len(region_results)} regions")
+        if overall_avg_pt_per_mm:
+            logger.info(f"Overall average: {overall_avg_pt_per_mm:.4f} pt/mm ({overall_avg_mm_per_pt:.4f} mm/pt)")
+        logger.info(f"Regions with scales: {len([r for r in region_results if r.average_scale_pt_per_mm])}")
         
         return response
         
@@ -227,35 +339,29 @@ async def calculate_scale(input_data: FilteredInput):
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Scale Calculation API - Simplified",
-        "version": "3.0.0",
-        "description": "Calculates scale (px/mm) per region using highest dimensions only",
+        "title": "Scale Calculation API",
+        "version": "2.0.0",
+        "description": "Calculates scale (pt/mm) per region from filtered vector data",
+        "endpoints": {
+            "/": "This page",
+            "/calculate-scale/": "POST - Calculate scale for each region",
+            "/health/": "GET - Health check"
+        },
         "workflow": [
-            "1. For each region, find highest horizontal dimension text",
-            "2. Find closest horizontal line to that text",
-            "3. Calculate scale: line_length_px / dimension_mm",
-            "4. Repeat for vertical dimension",
-            "5. Return raw calculations only"
+            "1. Receives filtered data with regions containing lines and dimension texts",
+            "2. For each region, finds highest horizontal and vertical dimension",
+            "3. Matches each dimension to nearest line with same orientation",
+            "4. Calculates scale by dividing dimension (mm) by line length (pt)",
+            "5. Validates scales against drawing type ranges",
+            "6. Returns scale per region with selected dimension and line info"
         ],
         "features": [
-            "✅ Only highest dimension per orientation",
-            "✅ Only closest line per dimension",
-            "✅ Raw scale calculations only",
-            "❌ No confidence scores",
-            "❌ No fallback strategies",
-            "❌ No weighted scoring"
-        ],
-        "output_format": {
-            "horizontal": {
-                "orientation": "horizontal",
-                "dimension_text": "2000 mm",
-                "dimension_mm": 2000.0,
-                "line_length_px": 530.0,
-                "scale_px_per_mm": 0.265,
-                "distance_to_line": 12.5
-            },
-            "vertical": "same format for vertical orientation"
-        }
+            "Deterministic: Always selects highest dimension value",
+            "10pt distance threshold for matching (with fallback)",
+            "Separate horizontal/vertical scales with comparison",
+            "Shows selected dimension text and matched line per region",
+            "Pure calculations only - no validation or defaults"
+        ]
     }
 
 @app.get("/health/")
@@ -264,11 +370,11 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "3.0.0",
+        "version": "2.0.0",
         "port": PORT
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Simplified Scale Calculation API on port {PORT}")
+    logger.info(f"Starting Scale Calculation API on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
