@@ -78,18 +78,14 @@ class ScaleMatch(BaseModel):
 
 class RegionScaleResult(BaseModel):
     region_label: str
-    horizontal: Optional[ScaleMatch] = None
-    vertical: Optional[ScaleMatch] = None
-    scales_match: bool
-    scale_ratio: Optional[float] = None
+    horizontal: Optional[Dict[str, Any]] = None
+    vertical: Optional[Dict[str, Any]] = None
     average_scale_pt_per_mm: Optional[float] = None
     average_scale_mm_per_pt: Optional[float] = None
 
 class ScaleOutput(BaseModel):
     drawing_type: str
     regions: List[RegionScaleResult]
-    overall_average_pt_per_mm: Optional[float] = None
-    overall_average_mm_per_pt: Optional[float] = None
     timestamp: str
 
 # Utility functions
@@ -193,8 +189,7 @@ def process_region(region: RegionData, drawing_type: str) -> RegionScaleResult:
     logger.info(f"Processing region: {region.label}")
     
     result = RegionScaleResult(
-        region_label=region.label,
-        scales_match=False
+        region_label=region.label
     )
     
     # Find highest horizontal dimension
@@ -213,12 +208,18 @@ def process_region(region: RegionData, drawing_type: str) -> RegionScaleResult:
             scale_mm_per_pt = h_dim.value_mm / h_match.line.length
             scale_pt_per_mm = 1 / scale_mm_per_pt
             
-            result.horizontal = ScaleMatch(
-                dimension=h_dim,
-                line_match=h_match,
-                scale_pt_per_mm=round(scale_pt_per_mm, 4),
-                scale_mm_per_pt=round(scale_mm_per_pt, 4)
-            )
+            result.horizontal = {
+                "dimension_text": h_dim.text,
+                "dimension_value": h_dim.value,
+                "dimension_unit": h_dim.unit,
+                "dimension_mm": h_dim.value_mm,
+                "line_length_pt": h_match.line.length,
+                "line_midpoint": {"x": h_match.line.midpoint.x, "y": h_match.line.midpoint.y},
+                "text_midpoint": h_text.midpoint,
+                "distance_text_to_line": round(h_match.distance, 2),
+                "scale_pt_per_mm": round(scale_pt_per_mm, 4),
+                "scale_mm_per_pt": round(scale_mm_per_pt, 4)
+            }
             
             logger.info(f"    Matched to line: {h_match.line.length:.1f}pt, distance: {h_match.distance:.1f}pt")
             logger.info(f"    Scale: {scale_pt_per_mm:.4f} pt/mm")
@@ -239,44 +240,41 @@ def process_region(region: RegionData, drawing_type: str) -> RegionScaleResult:
             scale_mm_per_pt = v_dim.value_mm / v_match.line.length
             scale_pt_per_mm = 1 / scale_mm_per_pt
             
-            result.vertical = ScaleMatch(
-                dimension=v_dim,
-                line_match=v_match,
-                scale_pt_per_mm=round(scale_pt_per_mm, 4),
-                scale_mm_per_pt=round(scale_mm_per_pt, 4)
-            )
+            result.vertical = {
+                "dimension_text": v_dim.text,
+                "dimension_value": v_dim.value,
+                "dimension_unit": v_dim.unit,
+                "dimension_mm": v_dim.value_mm,
+                "line_length_pt": v_match.line.length,
+                "line_midpoint": {"x": v_match.line.midpoint.x, "y": v_match.line.midpoint.y},
+                "text_midpoint": v_text.midpoint,
+                "distance_text_to_line": round(v_match.distance, 2),
+                "scale_pt_per_mm": round(scale_pt_per_mm, 4),
+                "scale_mm_per_pt": round(scale_mm_per_pt, 4)
+            }
             
             logger.info(f"    Matched to line: {v_match.line.length:.1f}pt, distance: {v_match.distance:.1f}pt")
             logger.info(f"    Scale: {scale_pt_per_mm:.4f} pt/mm")
     
-    # Compare scales and calculate average
+    # Calculate average if both scales available
     if result.horizontal and result.vertical:
-        h_scale = result.horizontal.scale_pt_per_mm
-        v_scale = result.vertical.scale_pt_per_mm
+        h_scale = result.horizontal["scale_pt_per_mm"]
+        v_scale = result.vertical["scale_pt_per_mm"]
         
-        # Calculate ratio
-        ratio = h_scale / v_scale if v_scale > 0 else 0
-        result.scale_ratio = round(ratio, 3)
-        
-        # Check if scales match (within tolerance)
-        result.scales_match = 0.9 <= ratio <= 1.1
-        
-        # Calculate average
         result.average_scale_pt_per_mm = round((h_scale + v_scale) / 2, 4)
         result.average_scale_mm_per_pt = round(1 / result.average_scale_pt_per_mm, 4)
         
-        logger.info(f"  Scale match: {result.scales_match} (ratio: {ratio:.3f})")
         logger.info(f"  Average scale: {result.average_scale_pt_per_mm:.4f} pt/mm")
         
     elif result.horizontal:
         # Only horizontal scale available
-        result.average_scale_pt_per_mm = result.horizontal.scale_pt_per_mm
-        result.average_scale_mm_per_pt = result.horizontal.scale_mm_per_pt
+        result.average_scale_pt_per_mm = result.horizontal["scale_pt_per_mm"]
+        result.average_scale_mm_per_pt = result.horizontal["scale_mm_per_pt"]
         
     elif result.vertical:
         # Only vertical scale available
-        result.average_scale_pt_per_mm = result.vertical.scale_pt_per_mm
-        result.average_scale_mm_per_pt = result.vertical.scale_mm_per_pt
+        result.average_scale_pt_per_mm = result.vertical["scale_pt_per_mm"]
+        result.average_scale_mm_per_pt = result.vertical["scale_mm_per_pt"]
     
     return result
 
@@ -289,7 +287,6 @@ async def calculate_scale(input_data: FilteredInput, debug: bool = Query(False))
         logger.info(f"Debug mode: {debug}")
         
         region_results = []
-        valid_scales = []
         
         # Process each region
         for region in input_data.regions:
@@ -301,33 +298,16 @@ async def calculate_scale(input_data: FilteredInput, debug: bool = Query(False))
             
             region_result = process_region(region, input_data.drawing_type)
             region_results.append(region_result)
-            
-            # Collect valid scales for overall average
-            if region_result.average_scale_pt_per_mm:
-                valid_scales.append(region_result.average_scale_pt_per_mm)
-        
-        # Calculate overall average
-        if valid_scales:
-            overall_avg_pt_per_mm = round(np.mean(valid_scales), 4)
-            overall_avg_mm_per_pt = round(1 / overall_avg_pt_per_mm, 4)
-        else:
-            overall_avg_pt_per_mm = None
-            overall_avg_mm_per_pt = None
-            logger.warning(f"No scales found")
         
         # Build response
         response = ScaleOutput(
             drawing_type=input_data.drawing_type,
             regions=region_results,
-            overall_average_pt_per_mm=overall_avg_pt_per_mm,
-            overall_average_mm_per_pt=overall_avg_mm_per_pt,
             timestamp=datetime.now().isoformat()
         )
         
         logger.info(f"\n=== Scale Calculation Complete ===")
-        if overall_avg_pt_per_mm:
-            logger.info(f"Overall average: {overall_avg_pt_per_mm:.4f} pt/mm ({overall_avg_mm_per_pt:.4f} mm/pt)")
-        logger.info(f"Regions with scales: {len([r for r in region_results if r.average_scale_pt_per_mm])}")
+        logger.info(f"Processed {len(region_results)} regions")
         
         return response
         
@@ -348,12 +328,10 @@ async def root():
             "/health/": "GET - Health check"
         },
         "workflow": [
-            "1. Receives filtered data with regions containing lines and dimension texts",
-            "2. For each region, finds highest horizontal and vertical dimension",
-            "3. Matches each dimension to nearest line with same orientation",
-            "4. Calculates scale by dividing dimension (mm) by line length (pt)",
-            "5. Validates scales against drawing type ranges",
-            "6. Returns scale per region with selected dimension and line info"
+            "1. For each region, finds highest horizontal and vertical dimension",
+            "2. Matches each dimension to nearest line with same orientation", 
+            "3. Calculates scale by dividing dimension (mm) by line length (pt)",
+            "4. Returns detailed calculation info per region"
         ],
         "features": [
             "Deterministic: Always selects highest dimension value",
