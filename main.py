@@ -38,7 +38,7 @@ class FilteredLine(BaseModel):
 class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
-    orientation: str
+    orientation: Optional[str] = None  # ← Made optional since Filter API doesn't send it anymore
 
 class RegionData(BaseModel):
     label: str
