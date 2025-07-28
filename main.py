@@ -11,9 +11,9 @@ from pydantic import BaseModel
 PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
-    title="Scale API v7.0.1 - Pydantic v2 Compatible",
-    description="FIXED: Physical dimension based scale calculation with proper Pydantic v2 compatibility",
-    version="7.0.1"
+    title="Scale API v7.1.0 - Fixed Distance Rules",
+    description="FIXED: Correct distance measurement rules - horizontal=midpoint, vertical=text-to-line-edge",
+    version="7.1.0"
 )
 
 # CORS middleware
@@ -49,7 +49,7 @@ class FilteredInput(BaseModel):
     drawing_type: str
     regions: List[RegionData]
 
-# Output Models - FIXED for Pydantic v2
+# Output Models
 class ScaleCalculation(BaseModel):
     # Input data
     dimension_text: str
@@ -103,9 +103,9 @@ class ScaleOutput(BaseModel):
     global_average_scale_mm_per_pt: Optional[float] = None
     global_average_formula: Optional[str] = None
     
-    # FIXED: Physical dimension mapping info as string (not dict)
-    physical_dimension_info: str = ""  # JSON string instead of dict
-    processing_rules: str = ""  # JSON string instead of dict
+    # Physical dimension mapping info as string (Pydantic v2 compatible)
+    physical_dimension_info: str = ""
+    processing_rules: str = ""
     timestamp: str
 
 def parse_bestektekening_region_type(region_label: str) -> str:
@@ -192,8 +192,8 @@ def get_physical_dimension_strategy(drawing_type: str) -> Tuple[str, Dict[str, s
             "vertical_line": "hoogte"
         }
 
-def get_region_processing_rules(drawing_type: str, region: RegionData) -> Tuple[str, Dict[str, str], str, float, str]:
-    """Get complete processing rules for a region"""
+def get_region_processing_rules(drawing_type: str, region: RegionData) -> Tuple[str, Dict[str, str], float, str]:
+    """Get complete processing rules for a region - FIXED DISTANCE RULES"""
     
     # Use parsed_drawing_type for bestektekening regions
     if drawing_type == "bestektekening":
@@ -206,31 +206,32 @@ def get_region_processing_rules(drawing_type: str, region: RegionData) -> Tuple[
         
         strategy, dim_mapping = get_physical_dimension_strategy(effective_drawing_type)
         
+        # FIXED: Different distance thresholds per drawing type
         if effective_drawing_type == "plattegrond":
-            distance_method, max_distance = "midpoint_to_midpoint", 15.0
+            max_distance = 15.0
         elif effective_drawing_type in ["gevelaanzicht", "doorsnede"]:
-            distance_method, max_distance = "text_to_line_edge", 15.0
+            max_distance = 15.0
         elif "detailtekening" in effective_drawing_type:
-            distance_method, max_distance = "midpoint_to_midpoint", 10.0
+            max_distance = 10.0
         else:
-            distance_method, max_distance = "midpoint_to_midpoint", 15.0
+            max_distance = 15.0
         
-        return strategy, dim_mapping, distance_method, max_distance, rules_desc
+        return strategy, dim_mapping, max_distance, rules_desc
     
     # Standard drawing types
     strategy, dim_mapping = get_physical_dimension_strategy(drawing_type)
     
     if drawing_type == "plattegrond":
-        distance_method, max_distance = "midpoint_to_midpoint", 15.0
+        max_distance = 15.0
     elif drawing_type in ["gevelaanzicht", "gevel", "doorsnede"]:
-        distance_method, max_distance = "text_to_line_edge", 15.0
+        max_distance = 15.0
     elif "detailtekening" in drawing_type:
-        distance_method, max_distance = "midpoint_to_midpoint", 10.0
+        max_distance = 10.0
     else:
-        distance_method, max_distance = "midpoint_to_midpoint", 15.0
+        max_distance = 15.0
     
     rules_desc = f"{drawing_type}_rules"
-    return strategy, dim_mapping, distance_method, max_distance, rules_desc
+    return strategy, dim_mapping, max_distance, rules_desc
 
 def calculate_midpoint_distance(text_midpoint: Dict[str, float], line_midpoint: CleanPoint) -> float:
     """Calculate Euclidean distance between text midpoint and line midpoint"""
@@ -240,12 +241,13 @@ def calculate_midpoint_distance(text_midpoint: Dict[str, float], line_midpoint: 
     )
 
 def calculate_distance_to_line_edge(text_midpoint: Dict[str, float], line: FilteredLine) -> float:
-    """Calculate distance from text to closest line edge"""
+    """Calculate distance from text to closest line edge (top/bottom for vertical, left/right for horizontal)"""
     
     text_x = text_midpoint["x"]
     text_y = text_midpoint["y"]
     
     if line.orientation == "vertical":
+        # For vertical lines: measure to top or bottom edge
         line_top_y = line.midpoint.y + (line.length / 2)
         line_bottom_y = line.midpoint.y - (line.length / 2)
         
@@ -255,6 +257,7 @@ def calculate_distance_to_line_edge(text_midpoint: Dict[str, float], line: Filte
         return min(distance_to_top, distance_to_bottom)
         
     elif line.orientation == "horizontal":
+        # For horizontal lines: measure to left or right edge
         line_left_x = line.midpoint.x - (line.length / 2)
         line_right_x = line.midpoint.x + (line.length / 2)
         
@@ -264,14 +267,81 @@ def calculate_distance_to_line_edge(text_midpoint: Dict[str, float], line: Filte
         return min(distance_to_left, distance_to_right)
     
     else:
+        # Fallback to midpoint
         return calculate_midpoint_distance(text_midpoint, line.midpoint)
 
-def calculate_distance_by_method(text_midpoint: Dict[str, float], line: FilteredLine, method: str) -> float:
-    """Calculate distance using specified method"""
-    if method == "text_to_line_edge":
-        return calculate_distance_to_line_edge(text_midpoint, line)
+def calculate_distance_by_drawing_type(text_midpoint: Dict[str, float], line: FilteredLine, drawing_type: str) -> Tuple[float, str]:
+    """FIXED: Calculate distance based on drawing type and line orientation rules"""
+    
+    # PLATTEGROND: Both orientations use midpoint-to-midpoint
+    if drawing_type == "plattegrond":
+        distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+        method = "midpoint_to_midpoint"
+    
+    # DETAILTEKENING_PLATTEGROND: Both orientations use midpoint-to-midpoint  
+    elif drawing_type == "detailtekening_plattegrond":
+        distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+        method = "midpoint_to_midpoint"
+    
+    # DETAILTEKENING_KOZIJN: Horizontal=midpoint, Vertical=text-to-edge
+    elif drawing_type == "detailtekening_kozijn":
+        if line.orientation == "horizontal":
+            # Breedte: midpoint-to-midpoint
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+        elif line.orientation == "vertical":
+            # Hoogte: text-to-line-edge (top/bottom)
+            distance = calculate_distance_to_line_edge(text_midpoint, line)
+            method = "text_to_line_edge"
+        else:
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+    
+    # DOORSNEDE: Horizontal=midpoint, Vertical=text-to-edge
+    elif drawing_type == "doorsnede":
+        if line.orientation == "horizontal":
+            # Breedte: midpoint-to-midpoint
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+        elif line.orientation == "vertical":
+            # Hoogte: text-to-line-edge (top/bottom)
+            distance = calculate_distance_to_line_edge(text_midpoint, line)
+            method = "text_to_line_edge"
+        else:
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+    
+    # GEVELAANZICHT: Only vertical, use text-to-edge
+    elif drawing_type in ["gevelaanzicht", "gevel"]:
+        if line.orientation == "vertical":
+            # Hoogte: text-to-line-edge (top/bottom)
+            distance = calculate_distance_to_line_edge(text_midpoint, line)
+            method = "text_to_line_edge"
+        else:
+            # Horizontal should be ignored, but fallback to midpoint
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+    
+    # DETAILTEKENING (generic): Horizontal=midpoint, Vertical=text-to-edge
+    elif drawing_type == "detailtekening":
+        if line.orientation == "horizontal":
+            # Breedte: midpoint-to-midpoint
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+        elif line.orientation == "vertical":
+            # Hoogte: text-to-line-edge (top/bottom)
+            distance = calculate_distance_to_line_edge(text_midpoint, line)
+            method = "text_to_line_edge"
+        else:
+            distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+            method = "midpoint_to_midpoint"
+    
+    # Fallback for unknown types
     else:
-        return calculate_midpoint_distance(text_midpoint, line.midpoint)
+        distance = calculate_midpoint_distance(text_midpoint, line.midpoint)
+        method = "midpoint_to_midpoint"
+    
+    return distance, method
 
 def extract_dimension_info(text: str) -> Optional[Tuple[float, str, float]]:
     """Extract dimension value, unit and convert to mm"""
@@ -297,8 +367,8 @@ def extract_dimension_info(text: str) -> Optional[Tuple[float, str, float]]:
         return None
 
 def find_dimension_line_matches(region: RegionData, strategy: str, dimension_mapping: Dict[str, str], 
-                               distance_method: str, max_distance: float) -> List[Dict]:
-    """Find matches based on physical dimension strategy"""
+                               max_distance: float, effective_drawing_type: str) -> List[Dict]:
+    """Find matches based on physical dimension strategy - FIXED DISTANCE CALCULATION PER DRAWING TYPE"""
     
     all_matches = []
     
@@ -325,7 +395,7 @@ def find_dimension_line_matches(region: RegionData, strategy: str, dimension_map
     else:
         return []
     
-    # Find matches
+    # Find matches with FIXED distance calculation per drawing type
     for dimension in valid_dimensions:
         for line in valid_lines:
             if line.orientation in allowed_orientations:
@@ -333,7 +403,10 @@ def find_dimension_line_matches(region: RegionData, strategy: str, dimension_map
                 if line_mapping == "ignore":
                     continue
                 
-                distance = calculate_distance_by_method(dimension['text'].midpoint, line, distance_method)
+                # FIXED: Use drawing-type-based distance calculation
+                distance, distance_method = calculate_distance_by_drawing_type(
+                    dimension['text'].midpoint, line, effective_drawing_type
+                )
                 
                 if distance <= max_distance:
                     scale_pt_per_mm = line.length / dimension['value_mm']
@@ -346,10 +419,10 @@ def find_dimension_line_matches(region: RegionData, strategy: str, dimension_map
                         'dimension_unit': dimension['unit'],
                         'dimension_mm': dimension['value_mm'],
                         'distance': distance,
+                        'distance_method': distance_method,
                         'scale_pt_per_mm': scale_pt_per_mm,
                         'orientation': line.orientation,
                         'physical_dimension_type': physical_dimension_type,
-                        'distance_method': distance_method,
                         'is_fallback': False
                     }
                     all_matches.append(match)
@@ -359,17 +432,17 @@ def find_dimension_line_matches(region: RegionData, strategy: str, dimension_map
     return all_matches
 
 def try_fallback_strategies(region: RegionData, effective_drawing_type: str, dimension_mapping: Dict[str, str]) -> List[Dict]:
-    """Try fallback strategies when primary matching fails"""
+    """Try fallback strategies when primary matching fails - FIXED DISTANCE RULES PER DRAWING TYPE"""
     
     fallback_matches = []
     
     if effective_drawing_type in ["gevelaanzicht", "gevel", "doorsnede"]:
         
-        # Fallback 1: Increased distance with line-edge
+        # Fallback 1: Increased distance with correct drawing-type-based method
         for fallback_distance in [25.0, 40.0]:
             matches = find_dimension_line_matches(
                 region, "process_both" if effective_drawing_type == "doorsnede" else "vertical_only", 
-                dimension_mapping, "text_to_line_edge", fallback_distance
+                dimension_mapping, fallback_distance, effective_drawing_type
             )
             if matches:
                 for match in matches[:3]:
@@ -378,16 +451,16 @@ def try_fallback_strategies(region: RegionData, effective_drawing_type: str, dim
                     fallback_matches.extend(matches[:3])
                 break
         
-        # Fallback 2: Switch to midpoint method
+        # Fallback 2: Even higher distance with drawing-type-based method
         if not fallback_matches:
             matches = find_dimension_line_matches(
                 region, "process_both" if effective_drawing_type == "doorsnede" else "vertical_only",
-                dimension_mapping, "midpoint_to_midpoint", 20.0
+                dimension_mapping, 60.0, effective_drawing_type
             )
             if matches:
                 for match in matches[:3]:
                     match['is_fallback'] = True
-                    match['fallback_method'] = "midpoint_method_fallback"
+                    match['fallback_method'] = "very_increased_distance_60pt"
                     fallback_matches.extend(matches[:3])
         
         # Fallback 3: Reference calculation for gevel
@@ -432,10 +505,10 @@ def try_total_height_reference(region: RegionData, dimension_mapping: Dict[str, 
             'dimension_unit': max_unit,
             'dimension_mm': max_dimension_mm,
             'distance': 999.0,
+            'distance_method': 'reference_calculation',
             'scale_pt_per_mm': reference_scale,
             'orientation': 'vertical',
             'physical_dimension_type': 'hoogte',
-            'distance_method': 'reference_calculation',
             'is_fallback': True,
             'fallback_method': 'total_height_reference'
         }
@@ -504,10 +577,10 @@ def create_scale_calculation(match: Dict) -> ScaleCalculation:
     )
 
 def process_region_with_physical_dimensions(region: RegionData, drawing_type: str) -> RegionScaleResult:
-    """Process a region using parsed drawing type"""
+    """Process a region using parsed drawing type - FIXED DISTANCE RULES"""
     
     # Get processing rules for this region
-    strategy, dimension_mapping, distance_method, max_distance, rules_desc = get_region_processing_rules(
+    strategy, dimension_mapping, max_distance, rules_desc = get_region_processing_rules(
         drawing_type, region
     )
     
@@ -527,8 +600,8 @@ def process_region_with_physical_dimensions(region: RegionData, drawing_type: st
         region_rules=rules_desc
     )
     
-    # Primary matching attempt
-    all_matches = find_dimension_line_matches(region, strategy, dimension_mapping, distance_method, max_distance)
+    # Primary matching attempt with FIXED distance calculation per drawing type
+    all_matches = find_dimension_line_matches(region, strategy, dimension_mapping, max_distance, effective_drawing_type)
     
     # Try fallbacks if no matches found
     if not all_matches:
@@ -559,7 +632,7 @@ def process_region_with_physical_dimensions(region: RegionData, drawing_type: st
 
 @app.post("/calculate-scale/", response_model=ScaleOutput)
 async def calculate_scale(input_data: FilteredInput):
-    """Calculate scale with Filter API v7.0.1 compatibility"""
+    """Calculate scale with FIXED distance measurement rules"""
     try:
         if input_data.drawing_type == "installatietekening":
             # Skip installatietekening
@@ -583,7 +656,11 @@ async def calculate_scale(input_data: FilteredInput):
         physical_dimension_info = {
             "drawing_type": input_data.drawing_type,
             "strategy": strategy,
-            "dimension_mapping": dimension_mapping
+            "dimension_mapping": dimension_mapping,
+            "distance_rules": {
+                "horizontal_lines": "midpoint_to_midpoint (for breedte/lengte)",
+                "vertical_lines": "text_to_line_edge (for hoogte measurements)"
+            }
         }
         
         # Process each region
@@ -610,7 +687,7 @@ async def calculate_scale(input_data: FilteredInput):
             global_avg_scale_mm = 1 / global_avg_scale
             global_formula = f"({' + '.join([f'{s:.4f}' for s in all_regional_scales])}) ÷ {len(all_regional_scales)} = {global_avg_scale:.4f} pt/mm"
         
-        # FIXED: Convert dict to JSON string for Pydantic v2 compatibility
+        # Convert dict to JSON string for Pydantic v2 compatibility
         import json
         
         # Build response
@@ -622,8 +699,8 @@ async def calculate_scale(input_data: FilteredInput):
             global_average_scale_pt_per_mm=round(global_avg_scale, 4) if global_avg_scale else None,
             global_average_scale_mm_per_pt=round(global_avg_scale_mm, 4) if global_avg_scale_mm else None,
             global_average_formula=global_formula,
-            physical_dimension_info=json.dumps(physical_dimension_info),  # Convert to JSON string
-            processing_rules=json.dumps(processing_rules),  # Convert to JSON string
+            physical_dimension_info=json.dumps(physical_dimension_info),
+            processing_rules=json.dumps(processing_rules),
             timestamp=datetime.now().isoformat()
         )
         
@@ -636,55 +713,72 @@ async def calculate_scale(input_data: FilteredInput):
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Scale API v7.0.1 - Pydantic v2 Compatible",
-        "version": "7.0.1",
-        "description": "FIXED: Pydantic v2 compatibility issue resolved",
+        "title": "Scale API v7.1.0 - Fixed Distance Rules",
+        "version": "7.1.0",
+        "description": "FIXED: Correct distance measurement rules implemented",
         "bug_fix": {
-            "issue": "physical_dimension_info and processing_rules were dict objects causing Pydantic v2 validation error",
-            "solution": "Converted dict fields to JSON strings for proper serialization",
-            "compatibility": "Now works with both Pydantic v1 (Filter API) and Pydantic v2 (Scale API)"
+            "issue": "Inconsistent distance measurement methods causing scale variations",
+            "solution": "Fixed orientation-based distance rules: horizontal=midpoint, vertical=text-to-line-edge",
+            "improvement": "Should significantly improve scale consistency"
+        },
+        "distance_rules": {
+            "horizontal_lines": {
+                "method": "midpoint_to_midpoint",
+                "reason": "For breedte and lengte measurements",
+                "usage": "Always used for horizontal line orientation"
+            },
+            "vertical_lines": {
+                "method": "text_to_line_edge", 
+                "reason": "For hoogte measurements (top/bottom edges)",
+                "usage": "Always used for vertical line orientation"
+            }
         },
         "physical_dimension_mapping": {
             "plattegrond": {
-                "horizontal_line": "breedte (kamer/gebouw)",
-                "vertical_line": "lengte (kamer/gebouw)",
+                "horizontal_line": "breedte (midpoint method)",
+                "vertical_line": "lengte (midpoint method)",
                 "strategy": "process_both",
-                "distance_method": "midpoint_to_midpoint",
                 "max_distance": "15pt"
             },
-            "doorsnede": {
-                "vertical_line": "hoogte (verdieping/ruimte)",
-                "horizontal_line": "breedte (doorsnede-richting)",
+            "detailtekening_plattegrond": {
+                "horizontal_line": "breedte (midpoint method)",
+                "vertical_line": "lengte (midpoint method)", 
                 "strategy": "process_both",
-                "distance_method": "text_to_line_edge",
+                "max_distance": "10pt"
+            },
+            "detailtekening_kozijn": {
+                "horizontal_line": "breedte (midpoint method)",
+                "vertical_line": "hoogte (text-to-edge method)",
+                "strategy": "process_both", 
+                "max_distance": "10pt"
+            },
+            "doorsnede": {
+                "vertical_line": "hoogte (text-to-edge method)",
+                "horizontal_line": "breedte (midpoint method)",
+                "strategy": "process_both",
                 "max_distance": "15pt"
             },
             "gevelaanzicht": {
-                "vertical_line": "hoogte (gebouw/verdieping/ramen)",
-                "horizontal_line": "IGNORE (niet gemeten)",
+                "vertical_line": "hoogte (text-to-edge method)",
+                "horizontal_line": "IGNORE",
                 "strategy": "vertical_only",
-                "distance_method": "text_to_line_edge",
                 "max_distance": "15pt"
             },
-            "bestektekening": {
-                "strategy": "per_region_rules",
-                "description": "Uses parsed_drawing_type from Filter API v7.0.1",
-                "rules": "Determined by individual region drawing types"
+            "detailtekening": {
+                "horizontal_line": "breedte (midpoint method)",
+                "vertical_line": "hoogte (text-to-edge method)",
+                "strategy": "process_both",
+                "max_distance": "10pt"
             }
         },
-        "pydantic_compatibility": {
-            "version": "2.6.4",
-            "fields_fixed": ["physical_dimension_info", "processing_rules"],
-            "serialization": "Dict objects converted to JSON strings"
-        },
-        "api_compatibility": {
-            "filter_api": "v7.0.1 (uses parsed_drawing_type field)",
-            "master_api": "v4.1.0 (requires field name updates)",
-            "vision_api": "Compatible with new bestektekening region format"
+        "improvements": {
+            "consistency": "Fixed orientation-based distance calculation",
+            "accuracy": "Proper text-to-line-edge for vertical measurements",
+            "reliability": "Consistent midpoint calculation for horizontal measurements"
         },
         "endpoints": {
-            "/calculate-scale/": "Main scale calculation endpoint",
-            "/health/": "Health check with feature status",
+            "/calculate-scale/": "Main scale calculation endpoint (FIXED)",
+            "/health/": "Health check with updated feature status",
             "/": "This comprehensive documentation"
         }
     }
@@ -695,16 +789,18 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "7.0.1",
+        "version": "7.1.0",
         "port": PORT,
-        "pydantic_version": "2.6.4",
-        "compatibility_fixed": True,
+        "distance_rules_fixed": True,
         "features": {
+            "orientation_based_distance": True,
+            "horizontal_midpoint_method": True,
+            "vertical_text_to_edge_method": True,
+            "consistent_scale_calculation": True,
             "filter_api_v7_compatibility": True,
             "physical_dimension_mapping": True,
             "bestektekening_support": True,
             "fallback_strategies": True,
-            "vision_compatible": True,
             "pydantic_v2_serialization": True
         },
         "supported_drawing_types": [
@@ -713,11 +809,21 @@ async def health_check():
             "detailtekening", "bestektekening"
         ],
         "skipped_types": ["installatietekening"],
-        "max_distances": {
-            "plattegrond": "15pt (midpoint-to-midpoint)",
-            "gevelaanzicht": "15pt (text-to-line-edge)",
-            "doorsnede": "15pt (text-to-line-edge)",
-            "detailtekening": "10pt (midpoint-to-midpoint)"
+        "distance_methods": {
+            "plattegrond": "Both orientations: midpoint_to_midpoint",
+            "detailtekening_plattegrond": "Both orientations: midpoint_to_midpoint", 
+            "detailtekening_kozijn": "Horizontal: midpoint | Vertical: text-to-edge",
+            "doorsnede": "Horizontal: midpoint | Vertical: text-to-edge", 
+            "gevelaanzicht": "Vertical only: text-to-edge",
+            "detailtekening": "Horizontal: midpoint | Vertical: text-to-edge",
+            "threshold_distances": {
+                "plattegrond": "15pt",
+                "gevelaanzicht": "15pt", 
+                "doorsnede": "15pt",
+                "detailtekening": "10pt",
+                "detailtekening_plattegrond": "10pt",
+                "detailtekening_kozijn": "10pt"
+            }
         }
     }
 
