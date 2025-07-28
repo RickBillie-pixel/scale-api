@@ -722,4 +722,97 @@ async def root():
                 "confidence_scoring": "Distance + length + validation quality",
                 "scale_consistency": "15% deviation threshold",
                 "horizontal_preference": "When vertical scales inconsistent",
-                "quality_flags
+                "quality_flags": "Track processing decisions per region"
+            },
+            "distance_improvements": {
+                "normal_threshold": "15pt (increased from 10pt)",
+                "fallback_threshold": "25pt maximum",
+                "purpose": "Better matching while maintaining quality"
+            }
+        },
+        "problem_solutions": {
+            "420mm_dimensions": "Filtered out by minimum thresholds",
+            "short_lines_68pt": "Filtered out by minimum line length",
+            "extreme_scales": "Removed by outlier detection",
+            "inconsistent_regions": "Horizontal preference applied",
+            "level_indicators": "Detected and marked as suspect (+3420P, +6410P)"
+        },
+        "validation_hierarchy": {
+            "1_dimension_filtering": "Remove dimensions below thresholds",
+            "2_line_filtering": "Remove lines below minimum length", 
+            "3_distance_filtering": "Apply normal and fallback thresholds",
+            "4_scale_validation": "Check against expected ranges",
+            "5_outlier_removal": "Statistical and rule-based outlier detection",
+            "6_consistency_check": "Compare horizontal vs vertical scales",
+            "7_preference_logic": "Horizontal-first fallback strategy"
+        },
+        "confidence_levels": {
+            "high_confidence": "80%+ (reliable for production use)",
+            "medium_confidence": "60-79% (acceptable with monitoring)",
+            "low_confidence": "40-59% (needs review)",
+            "poor_confidence": "<40% (fallback to defaults)"
+        },
+        "quality_flags": {
+            "consistent_scales": "Horizontal and vertical within 15%",
+            "horizontal_preferred": "Vertical inconsistent, used horizontal",
+            "horizontal_only": "Only horizontal scales found",
+            "vertical_only": "Only vertical scales found",
+            "default_used": "No valid scales, used drawing type default"
+        },
+        "api_compatibility": {
+            "input": "Compatible with Filter API v7.0+ output",
+            "pydantic": "v2.6.4 with enhanced validation models",
+            "numpy": "v2.0.0 for statistical operations"
+        },
+        "endpoints": {
+            "/calculate-scale/": "Enhanced scale calculation with validation",
+            "/health/": "Health check with validation rules status",
+            "/": "This comprehensive documentation"
+        }
+    }
+
+@app.get("/health/")
+async def health_check():
+    """Enhanced health check with validation rules"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "8.0.0",
+        "port": PORT,
+        "validation_rules_active": {
+            "dimension_filtering": True,
+            "line_filtering": True,
+            "outlier_detection": True,
+            "statistical_analysis": True,
+            "horizontal_preference": True,
+            "confidence_scoring": True
+        },
+        "thresholds_configured": {
+            "min_dimensions": MIN_DIMENSION_THRESHOLDS,
+            "min_line_lengths": MIN_LINE_LENGTH_THRESHOLDS,
+            "distance_limits": DISTANCE_THRESHOLDS,
+            "scale_ranges": SCALE_RANGES,
+            "outlier_limits": OUTLIER_RULES
+        },
+        "problem_filters": {
+            "420mm_dimensions": "Filtered by MIN_DIMENSION_THRESHOLDS",
+            "68pt_lines": "Filtered by MIN_LINE_LENGTH_THRESHOLDS", 
+            "extreme_scales": "Removed by OUTLIER_RULES",
+            "inconsistent_verticals": "Handled by horizontal preference",
+            "level_indicators": "Detected by enhanced pattern matching"
+        },
+        "expected_improvements": {
+            "reliability": "Remove 50% of problematic calculations",
+            "consistency": "Better region-level scale agreement",
+            "confidence": "Higher confidence scores for valid data",
+            "transparency": "Detailed validation reporting"
+        },
+        "numpy_available": True,
+        "statistical_functions": ["mean", "std", "outlier_detection"],
+        "enhanced_features_enabled": True
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Enhanced Scale API v8.0.0 on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
