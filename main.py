@@ -425,6 +425,7 @@ def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict]
                 match = {
                     'dimension': dimension,
                     'line': line,
+                    'text_midpoint': text.midpoint,  # Store original text midpoint
                     'distance': distance,
                     'scale_pt_per_mm': scale_pt_per_mm,
                     'scale_mm_per_pt': scale_mm_per_pt,
@@ -445,7 +446,8 @@ def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict]
     def remove_duplicate_texts(matches):
         text_best_matches = {}
         for match in matches:
-            text_key = match['dimension'].text + str(match['dimension'].midpoint)
+            # Use text content and position from the original text object
+            text_key = match['dimension'].text + str(match['text_midpoint'])
             if text_key not in text_best_matches or match['confidence'] > text_best_matches[text_key]['confidence']:
                 text_best_matches[text_key] = match
         return list(text_best_matches.values())
