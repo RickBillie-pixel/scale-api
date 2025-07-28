@@ -120,7 +120,7 @@ class FilteredLine(BaseModel):
 class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
-    orientation: str
+    orientation: Optional[str] = None  # Made optional for compatibility
 
 class RegionData(BaseModel):
     label: str
@@ -363,6 +363,11 @@ def calculate_confidence(distance: float, line_length: float, scale_validation: 
     
     return round(confidence * 100, 1)
 
+def calculate_text_orientation(text_midpoint: Dict[str, float], line: FilteredLine) -> str:
+    """Calculate text orientation based on line orientation and position relative to line"""
+    # Default to line orientation for compatibility
+    return line.orientation
+
 def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict], List[Dict]]:
     """Find best dimension-line matches with enhanced filtering"""
     
@@ -371,7 +376,7 @@ def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict]
     
     # Process each text for valid dimensions
     for text in region.texts:
-        # Try both orientations
+        # Try both orientations since Filter API doesn't provide text orientation
         for orientation in ["horizontal", "vertical"]:
             dimension = extract_dimension_with_validation(text.text, drawing_type, orientation)
             
@@ -434,6 +439,19 @@ def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict]
                     horizontal_matches.append(match)
                 else:
                     vertical_matches.append(match)
+    
+    # Remove duplicates (same text matched to different orientations)
+    # Keep the best match per text
+    def remove_duplicate_texts(matches):
+        text_best_matches = {}
+        for match in matches:
+            text_key = match['dimension'].text + str(match['dimension'].midpoint)
+            if text_key not in text_best_matches or match['confidence'] > text_best_matches[text_key]['confidence']:
+                text_best_matches[text_key] = match
+        return list(text_best_matches.values())
+    
+    horizontal_matches = remove_duplicate_texts(horizontal_matches)
+    vertical_matches = remove_duplicate_texts(vertical_matches)
     
     # Sort by confidence (best first)
     horizontal_matches.sort(key=lambda x: x['confidence'], reverse=True)
@@ -759,10 +777,11 @@ async def root():
             "vertical_only": "Only vertical scales found",
             "default_used": "No valid scales, used drawing type default"
         },
-        "api_compatibility": {
-            "input": "Compatible with Filter API v7.0+ output",
+        "compatibility": {
+            "input": "Compatible with Filter API output (orientation optional)",
             "pydantic": "v2.6.4 with enhanced validation models",
-            "numpy": "v2.0.0 for statistical operations"
+            "numpy": "v2.0.0 for statistical operations",
+            "filter_api_versions": "v6.0+ and v7.0+ (with/without text orientation)"
         },
         "endpoints": {
             "/calculate-scale/": "Enhanced scale calculation with validation",
