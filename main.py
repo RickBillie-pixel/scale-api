@@ -1,101 +1,19 @@
 import os
 import re
 import math
-import logging
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import numpy as np
+from pydantic import BaseModel
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Constants - ENHANCED BASED ON ANALYSIS
+# Constants
 PORT = int(os.environ.get("PORT", 10000))
 
-# 1. MINIMUM DIMENSION THRESHOLDS (filter kleine/onbetrouwbare dimensies)
-MIN_DIMENSION_THRESHOLDS = {
-    "plattegrond": {
-        "horizontal": 1000,  # mm - minimaal 1000mm voor horizontale dimensies
-        "vertical": 1000     # mm - minimaal 1000mm voor verticale dimensies  
-    },
-    "bestektekening": {
-        "horizontal": 2000,  # mm - minimaal 2000mm (4200, 4600 etc zijn OK)
-        "vertical": 800      # mm - minimaal 800mm (930 is OK, maar 420 niet)
-    },
-    "doorsnede": {
-        "horizontal": 1500,  # mm - minimaal 1500mm
-        "vertical": 800      # mm - minimaal 800mm (filter 420mm weg)
-    },
-    "gevelaanzicht": {
-        "horizontal": 1000,  # mm 
-        "vertical": 800      # mm
-    },
-    "detailtekening": {
-        "horizontal": 500,   # mm - kleinere details toegestaan
-        "vertical": 500      # mm
-    },
-    "installatietekening": {
-        "horizontal": 1000,  # mm
-        "vertical": 800      # mm
-    }
-}
-
-# 2. ENHANCED DISTANCE THRESHOLDS
-DISTANCE_THRESHOLDS = {
-    "normal": 15.0,     # pt - verhoog van 10 naar 15pt
-    "fallback": 25.0    # pt - maximum fallback distance
-}
-
-# 3. MINIMUM LINE LENGTH THRESHOLDS (filter korte lijnen)
-MIN_LINE_LENGTH_THRESHOLDS = {
-    "plattegrond": 80,       # pt
-    "bestektekening": 80,    # pt
-    "doorsnede": 80,         # pt - filter ~68pt lijnen weg
-    "gevelaanzicht": 60,     # pt
-    "detailtekening": 40,    # pt
-    "installatietekening": 50 # pt
-}
-
-# 4. SCALE VALIDATION RANGES (aangepast op basis van output)
-SCALE_RANGES = {
-    "plattegrond": {"min": 0.045, "max": 0.075},      # Rond 0.0567
-    "bestektekening": {"min": 0.045, "max": 0.075},   # Rond 0.0567
-    "doorsnede": {"min": 0.040, "max": 0.080},        # Meer variatie
-    "gevelaanzicht": {"min": 0.045, "max": 0.075},    
-    "detailtekening": {"min": 0.030, "max": 0.100},   
-    "installatietekening": {"min": 0.040, "max": 0.080}
-}
-
-# 5. OUTLIER DETECTION RULES
-OUTLIER_RULES = {
-    "max_scale_pt_per_mm": 0.12,     # Alles boven 0.12 is verdacht
-    "min_scale_pt_per_mm": 0.025,    # Alles onder 0.025 is verdacht
-    "max_variation_within_region": 0.03,  # Max std dev binnen 1 region
-    "dimension_line_ratio_max": 40,   # Max mm/pt ratio
-    "dimension_line_ratio_min": 12    # Min mm/pt ratio
-}
-
-# 6. DEFAULT SCALES (voor fallback)
-DEFAULT_SCALES = {
-    "plattegrond": 0.057,
-    "bestektekening": 0.057,
-    "doorsnede": 0.060,
-    "gevelaanzicht": 0.055,
-    "detailtekening": 0.060,
-    "installatietekening": 0.050
-}
-
 app = FastAPI(
-    title="Enhanced Scale API",
-    description="Advanced scale calculation with outlier detection and validation",
-    version="8.0.0"
+    title="Scale API v7.0.0 - Filter API v7.0.0 Compatible",
+    description="Physical dimension based scale calculation with Vision compatible bestektekening support",
+    version="7.0.0"
 )
 
 # CORS middleware
@@ -107,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input Models
+# Input Models (Compatible with Filter API v7.0.0)
 class CleanPoint(BaseModel):
     x: float
     y: float
@@ -120,720 +38,788 @@ class FilteredLine(BaseModel):
 class FilteredText(BaseModel):
     text: str
     midpoint: Dict[str, float]
-    orientation: Optional[str] = None  # Made optional for compatibility
 
 class RegionData(BaseModel):
     label: str
     lines: List[FilteredLine]
     texts: List[FilteredText]
+    parsed_drawing_type: Optional[str] = None  # From Filter API v7.0.0
 
 class FilteredInput(BaseModel):
     drawing_type: str
     regions: List[RegionData]
 
-# Enhanced Output Models
-class ValidationInfo(BaseModel):
-    status: str  # "valid", "outlier", "filtered_out", "suspect"
-    reason: str
-    threshold_used: Optional[float] = None
-
-class DimensionData(BaseModel):
-    value: float
-    unit: str
-    value_mm: float
-    text: str
-    validation: ValidationInfo
-
-class LineMatch(BaseModel):
-    line: FilteredLine
-    distance: float
-    validation: ValidationInfo
-
-class EnhancedScaleMatch(BaseModel):
-    dimension: DimensionData
-    line_match: LineMatch
+# Output Models
+class ScaleCalculation(BaseModel):
+    # Input data
+    dimension_text: str
+    dimension_value: float
+    dimension_unit: str
+    dimension_mm: float
+    line_length_pt: float
+    
+    # Positions
+    text_midpoint: Dict[str, float]
+    line_midpoint: Dict[str, float]
+    distance_text_to_line: float
+    distance_method: str
+    
+    # Physical dimension info
+    physical_dimension_type: str  # "hoogte", "breedte", "lengte"
+    line_orientation: str  # "horizontal", "vertical"
+    
+    # Calculation details
+    calculation_formula: str
     scale_pt_per_mm: float
     scale_mm_per_pt: float
-    ratio_mm_per_pt: float
-    confidence: float
-    validation: ValidationInfo
+    is_fallback: bool = False
+    fallback_method: Optional[str] = None
 
 class RegionScaleResult(BaseModel):
     region_label: str
-    horizontal: List[EnhancedScaleMatch] = []
-    vertical: List[EnhancedScaleMatch] = []
+    drawing_type: str
+    parsed_drawing_type: Optional[str] = None  # For bestektekening regions
+    dimension_strategy: str  # "process_both", "vertical_only"
+    region_rules: str
     
-    # Statistics
-    total_calculations: int = 0
-    filtered_small_dimensions: int = 0
-    filtered_short_lines: int = 0
-    outliers_removed: int = 0
+    # Calculations per physical dimension
+    vertical_calculations: List[ScaleCalculation] = []    # Hoogte or Lengte
+    horizontal_calculations: List[ScaleCalculation] = []  # Breedte
     
     # Region averages
-    horizontal_average: Optional[float] = None
-    vertical_average: Optional[float] = None
-    scales_consistent: bool = False
-    scale_deviation: Optional[float] = None
-    
-    # Final result
+    total_calculations: int = 0
     average_scale_pt_per_mm: Optional[float] = None
     average_scale_mm_per_pt: Optional[float] = None
-    confidence: float = 0.0
-    validation_status: str = "no_data"
-    quality_flags: List[str] = []
+    average_calculation_formula: Optional[str] = None
 
-class EnhancedScaleOutput(BaseModel):
+class ScaleOutput(BaseModel):
     drawing_type: str
+    total_regions: int
+    total_calculations: int
     regions: List[RegionScaleResult]
     
-    # Global statistics
-    total_regions_processed: int
-    total_calculations: int
-    total_filtered_dimensions: int
-    total_filtered_lines: int
-    total_outliers_removed: int
+    # Global average across all regions
+    global_average_scale_pt_per_mm: Optional[float] = None
+    global_average_scale_mm_per_pt: Optional[float] = None
+    global_average_formula: Optional[str] = None
     
-    # Global averages
-    overall_average_pt_per_mm: Optional[float] = None
-    overall_average_mm_per_pt: Optional[float] = None
-    
-    # Quality assessment
-    high_confidence_regions: int = 0
-    medium_confidence_regions: int = 0
-    low_confidence_regions: int = 0
-    
-    # Processing info
-    validation_rules_applied: Dict[str, Any] = {}
+    # Physical dimension mapping info
+    physical_dimension_info: Dict[str, str] = {}
+    processing_rules: Dict[str, str] = {}
     timestamp: str
 
-# Utility functions
-def extract_dimension_with_validation(text: str, drawing_type: str, orientation: str) -> Optional[DimensionData]:
-    """Extract and validate dimension"""
-    text_clean = text.strip()
+def parse_bestektekening_region_type(region_label: str) -> str:
+    """
+    Extract drawing type from bestektekening region label (same logic as Filter API)
+    Handles: "Begane grond (plattegrond)" → "plattegrond"
+    """
     
-    # Enhanced pattern matching including +3420P, +6410P formats
-    patterns = [
-        r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$',
-        r'^\+(\d+(?:[,.]\d+)?)\s*[pP]?\s*(mm|cm|m)?$',  # +3420P format
-        r'^(\d+(?:[,.]\d+)?)\s*[pP]\s*(mm|cm|m)?$'
-    ]
+    # Check for explicit type in parentheses first
+    if "(" in region_label and ")" in region_label:
+        try:
+            start = region_label.find("(") + 1
+            end = region_label.find(")")
+            extracted_type = region_label[start:end].strip()
+            
+            # Validate extracted type
+            valid_types = [
+                "plattegrond", "doorsnede", "gevelaanzicht", 
+                "detailtekening_kozijn", "detailtekening_plattegrond",
+                "detailtekening"
+            ]
+            
+            if extracted_type in valid_types:
+                return extracted_type
+                
+        except Exception:
+            pass
     
-    for pattern in patterns:
-        match = re.match(pattern, text_clean)
-        if match:
-            try:
-                value_str = match.group(1).replace(',', '.')
-                value = float(value_str)
-                unit = match.group(2) if len(match.groups()) > 1 and match.group(2) else 'mm'
-                
-                # Convert to mm
-                conversions = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0}
-                value_mm = value * conversions.get(unit, 1.0)
-                
-                # Validation
-                min_threshold = MIN_DIMENSION_THRESHOLDS.get(drawing_type, {}).get(orientation, 500)
-                
-                if value_mm < min_threshold:
-                    validation = ValidationInfo(
-                        status="filtered_out",
-                        reason=f"below_minimum_threshold",
-                        threshold_used=min_threshold
-                    )
-                    logger.debug(f"Filtered small dimension: {text_clean} = {value_mm}mm < {min_threshold}mm")
-                    return DimensionData(
-                        value=value, unit=unit, value_mm=value_mm, text=text_clean,
-                        validation=validation
-                    )
-                
-                # Check for suspicious patterns
-                if "+3420P" in text_clean or "+6410P" in text_clean:
-                    validation = ValidationInfo(
-                        status="suspect",
-                        reason="level_indicator_pattern",
-                        threshold_used=None
-                    )
-                    logger.warning(f"Suspect dimension pattern: {text_clean}")
-                else:
-                    validation = ValidationInfo(
-                        status="valid",
-                        reason="passed_validation",
-                        threshold_used=min_threshold
-                    )
-                
-                return DimensionData(
-                    value=value, unit=unit, value_mm=value_mm, text=text_clean,
-                    validation=validation
-                )
-                
-            except (ValueError, IndexError):
-                continue
+    # Fallback to keyword matching (legacy compatibility)
+    label_lower = region_label.lower()
     
-    return None
+    if "plattegrond" in label_lower or "grond" in label_lower or "verdieping" in label_lower:
+        return "plattegrond"
+    elif "gevel" in label_lower or "aanzicht" in label_lower:
+        return "gevelaanzicht"
+    elif "doorsnede" in label_lower:
+        return "doorsnede"
+    elif "detail" in label_lower:
+        if "kozijn" in label_lower or "raam" in label_lower or "deur" in label_lower:
+            return "detailtekening_kozijn"
+        else:
+            return "detailtekening"
+    else:
+        return "unknown"
 
-def validate_line_length(line: FilteredLine, drawing_type: str) -> ValidationInfo:
-    """Validate line length against thresholds"""
-    min_length = MIN_LINE_LENGTH_THRESHOLDS.get(drawing_type, 50)
+# Physical dimension strategy functions
+def get_physical_dimension_strategy(drawing_type: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Get dimension processing strategy and physical dimension mapping
+    Returns: (strategy, dimension_mapping)
+    """
     
-    if line.length < min_length:
-        return ValidationInfo(
-            status="filtered_out",
-            reason="line_too_short",
-            threshold_used=min_length
-        )
+    if drawing_type == "plattegrond":
+        return "process_both", {
+            "horizontal_line": "breedte",  # Horizontale lijn = breedte van kamer/gebouw
+            "vertical_line": "lengte"     # Verticale lijn = lengte van kamer/gebouw
+        }
     
-    return ValidationInfo(
-        status="valid",
-        reason="adequate_length",
-        threshold_used=min_length
+    elif drawing_type == "doorsnede":
+        return "process_both", {
+            "vertical_line": "hoogte",     # Verticale lijn = hoogte (verdieping, ruimte)
+            "horizontal_line": "breedte"   # Horizontale lijn = breedte (in doorsnede-richting)
+        }
+    
+    elif drawing_type == "gevelaanzicht" or drawing_type == "gevel":
+        return "vertical_only", {
+            "vertical_line": "hoogte",     # Verticale lijn = hoogte (gebouw, verdieping, ramen)
+            "horizontal_line": "ignore"    # Horizontale lijn = IGNORE (niet gemeten in gevels)
+        }
+    
+    elif drawing_type == "detailtekening_kozijn":
+        return "process_both", {
+            "horizontal_line": "breedte",  # Horizontale lijn = breedte van kozijn
+            "vertical_line": "hoogte"     # Verticale lijn = hoogte van kozijn
+        }
+    
+    elif drawing_type == "detailtekening_plattegrond":
+        return "process_both", {
+            "horizontal_line": "breedte",  # Horizontale lijn = breedte 
+            "vertical_line": "lengte"     # Verticale lijn = lengte
+        }
+    
+    elif drawing_type == "detailtekening":
+        # Default voor als Vision geen onderscheid maakt
+        return "process_both", {
+            "horizontal_line": "breedte",  
+            "vertical_line": "hoogte"     # Default: kozijn-achtig
+        }
+    
+    else:
+        # Default strategy
+        return "process_both", {
+            "horizontal_line": "breedte",
+            "vertical_line": "hoogte"
+        }
+
+def get_region_processing_rules(drawing_type: str, region: RegionData) -> Tuple[str, Dict[str, str], str, float, str]:
+    """
+    Get complete processing rules for a region using parsed drawing type from Filter API v7.0.0
+    Returns: (strategy, dimension_mapping, distance_method, max_distance, rules_description)
+    """
+    
+    # Use parsed_drawing_type for bestektekening regions
+    if drawing_type == "bestektekening":
+        if region.parsed_drawing_type:
+            # Use pre-parsed drawing type from Filter API v7.0.0
+            effective_drawing_type = region.parsed_drawing_type
+            rules_desc = f"bestektekening_parsed_{effective_drawing_type}_rules"
+        else:
+            # Fallback: parse ourselves (for compatibility)
+            effective_drawing_type = parse_bestektekening_region_type(region.label)
+            rules_desc = f"bestektekening_fallback_{effective_drawing_type}_rules"
+        
+        # Get strategy and dimension mapping for the effective drawing type
+        strategy, dim_mapping = get_physical_dimension_strategy(effective_drawing_type)
+        
+        # Get distance method and max distance
+        if effective_drawing_type == "plattegrond":
+            distance_method, max_distance = "midpoint_to_midpoint", 15.0
+        elif effective_drawing_type in ["gevelaanzicht", "doorsnede"]:
+            distance_method, max_distance = "text_to_line_edge", 15.0
+        elif "detailtekening" in effective_drawing_type:
+            distance_method, max_distance = "midpoint_to_midpoint", 10.0
+        else:
+            distance_method, max_distance = "midpoint_to_midpoint", 15.0
+        
+        return strategy, dim_mapping, distance_method, max_distance, rules_desc
+    
+    # Standard drawing types
+    strategy, dim_mapping = get_physical_dimension_strategy(drawing_type)
+    
+    # Distance method and max distance based on drawing type
+    if drawing_type == "plattegrond":
+        distance_method, max_distance = "midpoint_to_midpoint", 15.0
+    elif drawing_type in ["gevelaanzicht", "gevel", "doorsnede"]:
+        distance_method, max_distance = "text_to_line_edge", 15.0
+    elif "detailtekening" in drawing_type:
+        distance_method, max_distance = "midpoint_to_midpoint", 10.0
+    else:
+        distance_method, max_distance = "midpoint_to_midpoint", 15.0
+    
+    rules_desc = f"{drawing_type}_rules"
+    return strategy, dim_mapping, distance_method, max_distance, rules_desc
+
+# Distance calculation functions
+def calculate_midpoint_distance(text_midpoint: Dict[str, float], line_midpoint: CleanPoint) -> float:
+    """Calculate Euclidean distance between text midpoint and line midpoint"""
+    return math.sqrt(
+        (text_midpoint["x"] - line_midpoint.x)**2 + 
+        (text_midpoint["y"] - line_midpoint.y)**2
     )
 
-def calculate_distance(p1: Dict[str, float], p2: CleanPoint) -> float:
-    """Calculate Euclidean distance"""
-    return math.sqrt((p2.x - p1["x"])**2 + (p2.y - p1["y"])**2)
-
-def validate_scale(scale_pt_per_mm: float, drawing_type: str, dimension_mm: float, line_length_pt: float) -> ValidationInfo:
-    """Enhanced scale validation"""
+def calculate_distance_to_line_edge(text_midpoint: Dict[str, float], line: FilteredLine) -> float:
+    """Calculate distance from text to closest line edge"""
     
-    # Check basic range
-    expected_range = SCALE_RANGES.get(drawing_type, {"min": 0.03, "max": 0.10})
+    text_x = text_midpoint["x"]
+    text_y = text_midpoint["y"]
     
-    if scale_pt_per_mm < OUTLIER_RULES["min_scale_pt_per_mm"]:
-        return ValidationInfo(
-            status="outlier",
-            reason=f"scale_too_low_global",
-            threshold_used=OUTLIER_RULES["min_scale_pt_per_mm"]
-        )
+    if line.orientation == "vertical":
+        line_top_y = line.midpoint.y + (line.length / 2)
+        line_bottom_y = line.midpoint.y - (line.length / 2)
+        
+        distance_to_top = math.sqrt((text_x - line.midpoint.x)**2 + (text_y - line_top_y)**2)
+        distance_to_bottom = math.sqrt((text_x - line.midpoint.x)**2 + (text_y - line_bottom_y)**2)
+        
+        return min(distance_to_top, distance_to_bottom)
+        
+    elif line.orientation == "horizontal":
+        line_left_x = line.midpoint.x - (line.length / 2)
+        line_right_x = line.midpoint.x + (line.length / 2)
+        
+        distance_to_left = math.sqrt((text_x - line_left_x)**2 + (text_y - line.midpoint.y)**2)
+        distance_to_right = math.sqrt((text_x - line_right_x)**2 + (text_y - line.midpoint.y)**2)
+        
+        return min(distance_to_left, distance_to_right)
     
-    if scale_pt_per_mm > OUTLIER_RULES["max_scale_pt_per_mm"]:
-        return ValidationInfo(
-            status="outlier", 
-            reason=f"scale_too_high_global",
-            threshold_used=OUTLIER_RULES["max_scale_pt_per_mm"]
-        )
-    
-    # Check dimension/line ratio
-    ratio_mm_per_pt = dimension_mm / line_length_pt
-    if ratio_mm_per_pt > OUTLIER_RULES["dimension_line_ratio_max"]:
-        return ValidationInfo(
-            status="outlier",
-            reason="dimension_line_ratio_too_high",
-            threshold_used=OUTLIER_RULES["dimension_line_ratio_max"]
-        )
-    
-    if ratio_mm_per_pt < OUTLIER_RULES["dimension_line_ratio_min"]:
-        return ValidationInfo(
-            status="outlier",
-            reason="dimension_line_ratio_too_low", 
-            threshold_used=OUTLIER_RULES["dimension_line_ratio_min"]
-        )
-    
-    # Check drawing type specific range
-    if expected_range["min"] <= scale_pt_per_mm <= expected_range["max"]:
-        return ValidationInfo(
-            status="valid",
-            reason="within_expected_range",
-            threshold_used=None
-        )
     else:
-        return ValidationInfo(
-            status="suspect",
-            reason=f"outside_expected_range_{expected_range['min']}-{expected_range['max']}",
-            threshold_used=None
-        )
+        return calculate_midpoint_distance(text_midpoint, line.midpoint)
 
-def calculate_confidence(distance: float, line_length: float, scale_validation: str) -> float:
-    """Enhanced confidence calculation"""
-    # Distance component (0-1, lower distance = higher score)
-    distance_score = max(0, 1 - (distance / DISTANCE_THRESHOLDS["normal"]))
-    
-    # Line length component (0-1, longer lines = higher score)
-    length_score = min(1, line_length / 200)  # 200pt = full score
-    
-    # Validation component
-    validation_multipliers = {
-        "valid": 1.0,
-        "suspect": 0.7,
-        "outlier": 0.3,
-        "filtered_out": 0.1
-    }
-    validation_score = validation_multipliers.get(scale_validation, 0.5)
-    
-    # Weighted combination
-    confidence = (0.4 * distance_score + 0.3 * length_score + 0.3) * validation_score
-    
-    return round(confidence * 100, 1)
+def calculate_distance_by_method(text_midpoint: Dict[str, float], line: FilteredLine, method: str) -> float:
+    """Calculate distance using specified method"""
+    if method == "text_to_line_edge":
+        return calculate_distance_to_line_edge(text_midpoint, line)
+    else:  # "midpoint_to_midpoint"
+        return calculate_midpoint_distance(text_midpoint, line.midpoint)
 
-def calculate_text_orientation(text_midpoint: Dict[str, float], line: FilteredLine) -> str:
-    """Calculate text orientation based on line orientation and position relative to line"""
-    # Default to line orientation for compatibility
-    return line.orientation
-
-def find_best_matches(region: RegionData, drawing_type: str) -> Tuple[List[Dict], List[Dict]]:
-    """Find best dimension-line matches with enhanced filtering"""
+def extract_dimension_info(text: str) -> Optional[Tuple[float, str, float]]:
+    """Extract dimension value, unit and convert to mm"""
+    text = text.strip()
     
+    pattern = r'^(\d+(?:[,.]\d+)?)\s*(mm|cm|m)?$'
+    match = re.match(pattern, text)
+    
+    if not match:
+        return None
+    
+    try:
+        value_str = match.group(1).replace(',', '.')
+        value = float(value_str)
+        unit = match.group(2) if match.group(2) else 'mm'
+        
+        conversions = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0}
+        value_mm = value * conversions.get(unit, 1.0)
+        
+        return (value, unit, value_mm)
+        
+    except (ValueError, IndexError):
+        return None
+
+def find_dimension_line_matches(region: RegionData, strategy: str, dimension_mapping: Dict[str, str], 
+                               distance_method: str, max_distance: float) -> List[Dict]:
+    """Find matches based on physical dimension strategy"""
+    
+    all_matches = []
+    
+    # Get all valid dimensions
+    valid_dimensions = []
+    for text in region.texts:
+        dim_result = extract_dimension_info(text.text)
+        if dim_result:
+            value, unit, value_mm = dim_result
+            valid_dimensions.append({
+                'text': text,
+                'value': value,
+                'unit': unit,
+                'value_mm': value_mm
+            })
+    
+    # Filter lines based on strategy
+    if strategy == "vertical_only":
+        # Only process vertical lines (hoogte)
+        valid_lines = [line for line in region.lines if line.orientation == "vertical"]
+        allowed_orientations = ["vertical"]
+    elif strategy == "process_both":
+        # Process both orientations
+        valid_lines = region.lines
+        allowed_orientations = ["horizontal", "vertical"]
+    else:
+        return []
+    
+    # Find matches
+    for dimension in valid_dimensions:
+        for line in valid_lines:
+            if line.orientation in allowed_orientations:
+                # Skip if this orientation should be ignored
+                line_mapping = dimension_mapping.get(f"{line.orientation}_line", "")
+                if line_mapping == "ignore":
+                    continue
+                
+                distance = calculate_distance_by_method(dimension['text'].midpoint, line, distance_method)
+                
+                if distance <= max_distance:
+                    scale_pt_per_mm = line.length / dimension['value_mm']
+                    physical_dimension_type = dimension_mapping.get(f"{line.orientation}_line", "unknown")
+                    
+                    match = {
+                        'text': dimension['text'],
+                        'line': line,
+                        'dimension_value': dimension['value'],
+                        'dimension_unit': dimension['unit'],
+                        'dimension_mm': dimension['value_mm'],
+                        'distance': distance,
+                        'scale_pt_per_mm': scale_pt_per_mm,
+                        'orientation': line.orientation,
+                        'physical_dimension_type': physical_dimension_type,
+                        'distance_method': distance_method,
+                        'is_fallback': False
+                    }
+                    all_matches.append(match)
+    
+    # Sort by distance (best first)
+    all_matches.sort(key=lambda x: x['distance'])
+    return all_matches
+
+def try_fallback_strategies(region: RegionData, effective_drawing_type: str, dimension_mapping: Dict[str, str]) -> List[Dict]:
+    """Try fallback strategies when primary matching fails"""
+    
+    fallback_matches = []
+    
+    if effective_drawing_type in ["gevelaanzicht", "gevel", "doorsnede"]:
+        
+        # Fallback 1: Increased distance with line-edge
+        for fallback_distance in [25.0, 40.0]:
+            matches = find_dimension_line_matches(
+                region, "process_both" if effective_drawing_type == "doorsnede" else "vertical_only", 
+                dimension_mapping, "text_to_line_edge", fallback_distance
+            )
+            if matches:
+                for match in matches[:3]:  # Take best 3
+                    match['is_fallback'] = True
+                    match['fallback_method'] = f"increased_distance_{fallback_distance}pt"
+                    fallback_matches.extend(matches[:3])
+                break
+        
+        # Fallback 2: Switch to midpoint method
+        if not fallback_matches:
+            matches = find_dimension_line_matches(
+                region, "process_both" if effective_drawing_type == "doorsnede" else "vertical_only",
+                dimension_mapping, "midpoint_to_midpoint", 20.0
+            )
+            if matches:
+                for match in matches[:3]:
+                    match['is_fallback'] = True
+                    match['fallback_method'] = "midpoint_method_fallback"
+                    fallback_matches.extend(matches[:3])
+        
+        # Fallback 3: Reference calculation for gevel
+        if not fallback_matches and effective_drawing_type in ["gevelaanzicht", "gevel"]:
+            reference_match = try_total_height_reference(region, dimension_mapping)
+            if reference_match:
+                fallback_matches.append(reference_match)
+    
+    return fallback_matches
+
+def try_total_height_reference(region: RegionData, dimension_mapping: Dict[str, str]) -> Optional[Dict]:
+    """Try total height reference calculation for gevel"""
+    try:
+        # Find highest dimension (total building height)
+        all_dimensions = []
+        for text in region.texts:
+            dim_result = extract_dimension_info(text.text)
+            if dim_result:
+                value, unit, value_mm = dim_result
+                all_dimensions.append((value_mm, text, value, unit))
+        
+        if not all_dimensions:
+            return None
+        
+        # Get highest dimension
+        max_dimension_mm, max_text, max_value, max_unit = max(all_dimensions)
+        
+        # Find longest vertical line (total building height)
+        vertical_lines = [line for line in region.lines if line.orientation == "vertical"]
+        if not vertical_lines:
+            return None
+        
+        longest_line = max(vertical_lines, key=lambda x: x.length)
+        
+        # Create reference calculation
+        reference_scale = longest_line.length / max_dimension_mm
+        
+        return {
+            'text': max_text,
+            'line': longest_line,
+            'dimension_value': max_value,
+            'dimension_unit': max_unit,
+            'dimension_mm': max_dimension_mm,
+            'distance': 999.0,  # Indicates reference calculation
+            'scale_pt_per_mm': reference_scale,
+            'orientation': 'vertical',
+            'physical_dimension_type': 'hoogte',
+            'distance_method': 'reference_calculation',
+            'is_fallback': True,
+            'fallback_method': 'total_height_reference'
+        }
+        
+    except Exception:
+        return None
+
+def select_best_matches_per_orientation(all_matches: List[Dict], max_per_orientation: int = 3) -> Tuple[List[Dict], List[Dict]]:
+    """Select best matches per orientation, avoiding duplicates"""
+    
+    used_texts = set()
+    used_lines = set()
     horizontal_matches = []
     vertical_matches = []
     
-    # Process each text for valid dimensions
-    for text in region.texts:
-        # Try both orientations since Filter API doesn't provide text orientation
-        for orientation in ["horizontal", "vertical"]:
-            dimension = extract_dimension_with_validation(text.text, drawing_type, orientation)
+    # First pass: collect horizontal matches
+    for match in all_matches:
+        if (len(horizontal_matches) < max_per_orientation and 
+            match['orientation'] == 'horizontal' and
+            id(match['text']) not in used_texts and 
+            id(match['line']) not in used_lines):
             
-            if not dimension or dimension.validation.status == "filtered_out":
-                continue
+            horizontal_matches.append(match)
+            used_texts.add(id(match['text']))
+            used_lines.add(id(match['line']))
+    
+    # Second pass: collect vertical matches
+    for match in all_matches:
+        if (len(vertical_matches) < max_per_orientation and 
+            match['orientation'] == 'vertical' and
+            id(match['text']) not in used_texts and 
+            id(match['line']) not in used_lines):
             
-            # Find matching lines
-            matching_lines = [line for line in region.lines if line.orientation == orientation]
-            
-            for line in matching_lines:
-                # Validate line length
-                line_validation = validate_line_length(line, drawing_type)
-                if line_validation.status == "filtered_out":
-                    continue
-                
-                # Calculate distance
-                distance = calculate_distance(text.midpoint, line.midpoint)
-                
-                # Apply distance threshold with fallback
-                is_fallback = False
-                if distance <= DISTANCE_THRESHOLDS["normal"]:
-                    distance_validation = ValidationInfo(status="valid", reason="within_normal_threshold")
-                elif distance <= DISTANCE_THRESHOLDS["fallback"]:
-                    distance_validation = ValidationInfo(status="suspect", reason="fallback_threshold_used")
-                    is_fallback = True
-                else:
-                    continue  # Skip if too far
-                
-                # Calculate scale
-                scale_pt_per_mm = line.length / dimension.value_mm
-                scale_mm_per_pt = 1 / scale_pt_per_mm
-                ratio_mm_per_pt = dimension.value_mm / line.length
-                
-                # Validate scale
-                scale_validation = validate_scale(scale_pt_per_mm, drawing_type, dimension.value_mm, line.length)
-                
-                # Skip outliers
-                if scale_validation.status == "outlier":
-                    logger.warning(f"Outlier removed: {dimension.text} -> {scale_pt_per_mm:.4f} pt/mm ({scale_validation.reason})")
-                    continue
-                
-                # Calculate confidence
-                confidence = calculate_confidence(distance, line.length, scale_validation.status)
-                
-                # Create match
-                match = {
-                    'dimension': dimension,
-                    'line': line,
-                    'text_midpoint': text.midpoint,  # Store original text midpoint
-                    'distance': distance,
-                    'scale_pt_per_mm': scale_pt_per_mm,
-                    'scale_mm_per_pt': scale_mm_per_pt,
-                    'ratio_mm_per_pt': ratio_mm_per_pt,
-                    'confidence': confidence,
-                    'distance_validation': distance_validation,
-                    'scale_validation': scale_validation,
-                    'is_fallback': is_fallback
-                }
-                
-                if orientation == "horizontal":
-                    horizontal_matches.append(match)
-                else:
-                    vertical_matches.append(match)
+            vertical_matches.append(match)
+            used_texts.add(id(match['text']))
+            used_lines.add(id(match['line']))
     
-    # Remove duplicates (same text matched to different orientations)
-    # Keep the best match per text
-    def remove_duplicate_texts(matches):
-        text_best_matches = {}
-        for match in matches:
-            # Use text content and position from the original text object
-            text_key = match['dimension'].text + str(match['text_midpoint'])
-            if text_key not in text_best_matches or match['confidence'] > text_best_matches[text_key]['confidence']:
-                text_best_matches[text_key] = match
-        return list(text_best_matches.values())
-    
-    horizontal_matches = remove_duplicate_texts(horizontal_matches)
-    vertical_matches = remove_duplicate_texts(vertical_matches)
-    
-    # Sort by confidence (best first)
-    horizontal_matches.sort(key=lambda x: x['confidence'], reverse=True)
-    vertical_matches.sort(key=lambda x: x['confidence'], reverse=True)
-    
-    # Take top 3 per orientation
-    return horizontal_matches[:3], vertical_matches[:3]
+    return horizontal_matches, vertical_matches
 
-def detect_and_remove_outliers(scales: List[float]) -> Tuple[List[float], int]:
-    """Remove statistical outliers from scale list"""
-    if len(scales) < 3:
-        return scales, 0
+def create_scale_calculation(match: Dict) -> ScaleCalculation:
+    """Create ScaleCalculation object from match data"""
     
-    scales_array = np.array(scales)
-    mean_scale = np.mean(scales_array)
-    std_scale = np.std(scales_array)
+    scale_pt_per_mm = match['scale_pt_per_mm']
+    scale_mm_per_pt = 1 / scale_pt_per_mm
     
-    # Remove values more than 2 standard deviations from mean
-    threshold = 2 * std_scale
-    filtered_scales = []
-    outliers_removed = 0
+    formula_suffix = " (reference)" if match.get('is_fallback') and "reference" in match.get('fallback_method', '') else ""
+    formula = f"{match['line'].length:.1f}pt ÷ {match['dimension_mm']:.0f}mm = {scale_pt_per_mm:.4f} pt/mm{formula_suffix}"
     
-    for scale in scales:
-        if abs(scale - mean_scale) <= threshold:
-            filtered_scales.append(scale)
-        else:
-            outliers_removed += 1
-            logger.warning(f"Statistical outlier removed: {scale:.4f} (mean: {mean_scale:.4f}, std: {std_scale:.4f})")
-    
-    return filtered_scales, outliers_removed
+    return ScaleCalculation(
+        dimension_text=match['text'].text,
+        dimension_value=match['dimension_value'],
+        dimension_unit=match['dimension_unit'],
+        dimension_mm=match['dimension_mm'],
+        line_length_pt=match['line'].length,
+        text_midpoint=match['text'].midpoint,
+        line_midpoint={"x": match['line'].midpoint.x, "y": match['line'].midpoint.y},
+        distance_text_to_line=round(match['distance'], 2),
+        distance_method=match['distance_method'],
+        physical_dimension_type=match['physical_dimension_type'],
+        line_orientation=match['orientation'],
+        calculation_formula=formula,
+        scale_pt_per_mm=round(scale_pt_per_mm, 4),
+        scale_mm_per_pt=round(scale_mm_per_pt, 4),
+        is_fallback=match.get('is_fallback', False),
+        fallback_method=match.get('fallback_method')
+    )
 
-def process_region_enhanced(region: RegionData, drawing_type: str) -> RegionScaleResult:
-    """Process region with enhanced validation and filtering"""
+def process_region_with_physical_dimensions(region: RegionData, drawing_type: str) -> RegionScaleResult:
+    """
+    Process a region using parsed drawing type from Filter API v7.0.0
+    """
     
-    logger.info(f"Processing region: {region.label}")
+    # Get processing rules for this region (uses parsed_drawing_type if available)
+    strategy, dimension_mapping, distance_method, max_distance, rules_desc = get_region_processing_rules(
+        drawing_type, region
+    )
+    
+    # Determine effective drawing type for processing
+    if drawing_type == "bestektekening" and region.parsed_drawing_type:
+        effective_drawing_type = region.parsed_drawing_type
+    elif drawing_type == "bestektekening":
+        effective_drawing_type = parse_bestektekening_region_type(region.label)
+    else:
+        effective_drawing_type = drawing_type
     
     result = RegionScaleResult(
         region_label=region.label,
-        validation_status="processing"
+        drawing_type=drawing_type,
+        parsed_drawing_type=region.parsed_drawing_type,  # Include parsed type
+        dimension_strategy=strategy,
+        region_rules=rules_desc
     )
     
-    # Find matches with enhanced filtering
-    horizontal_matches, vertical_matches = find_best_matches(region, drawing_type)
+    # Primary matching attempt
+    all_matches = find_dimension_line_matches(region, strategy, dimension_mapping, distance_method, max_distance)
     
-    # Convert to enhanced scale matches
-    for match in horizontal_matches:
-        line_match = LineMatch(
-            line=match['line'],
-            distance=round(match['distance'], 2),
-            validation=match['distance_validation']
-        )
+    # Try fallbacks if no matches found
+    if not all_matches:
+        all_matches = try_fallback_strategies(region, effective_drawing_type, dimension_mapping)
+    
+    if not all_matches:
+        return result
+    
+    # Select best matches per orientation
+    horizontal_matches, vertical_matches = select_best_matches_per_orientation(all_matches, 3)
+    
+    # Create scale calculations
+    result.horizontal_calculations = [create_scale_calculation(match) for match in horizontal_matches]
+    result.vertical_calculations = [create_scale_calculation(match) for match in vertical_matches]
+    
+    # Calculate region averages
+    all_scale_values = [match['scale_pt_per_mm'] for match in horizontal_matches + vertical_matches]
+    result.total_calculations = len(all_scale_values)
+    
+    if all_scale_values:
+        avg_scale = sum(all_scale_values) / len(all_scale_values)
+        result.average_scale_pt_per_mm = round(avg_scale, 4)
+        result.average_scale_mm_per_pt = round(1 / avg_scale, 4)
         
-        enhanced_match = EnhancedScaleMatch(
-            dimension=match['dimension'],
-            line_match=line_match,
-            scale_pt_per_mm=round(match['scale_pt_per_mm'], 4),
-            scale_mm_per_pt=round(match['scale_mm_per_pt'], 4),
-            ratio_mm_per_pt=round(match['ratio_mm_per_pt'], 2),
-            confidence=match['confidence'],
-            validation=match['scale_validation']
-        )
-        result.horizontal.append(enhanced_match)
-    
-    for match in vertical_matches:
-        line_match = LineMatch(
-            line=match['line'],
-            distance=round(match['distance'], 2),
-            validation=match['distance_validation']
-        )
-        
-        enhanced_match = EnhancedScaleMatch(
-            dimension=match['dimension'],
-            line_match=line_match,
-            scale_pt_per_mm=round(match['scale_pt_per_mm'], 4),
-            scale_mm_per_pt=round(match['scale_mm_per_pt'], 4),
-            ratio_mm_per_pt=round(match['ratio_mm_per_pt'], 2),
-            confidence=match['confidence'],
-            validation=match['scale_validation']
-        )
-        result.vertical.append(enhanced_match)
-    
-    # Calculate statistics
-    result.total_calculations = len(result.horizontal) + len(result.vertical)
-    
-    # Calculate averages per orientation
-    if result.horizontal:
-        h_scales = [m.scale_pt_per_mm for m in result.horizontal if m.validation.status == "valid"]
-        if h_scales:
-            h_scales_clean, h_outliers = detect_and_remove_outliers(h_scales)
-            if h_scales_clean:
-                result.horizontal_average = round(float(np.mean(h_scales_clean)), 4)  # Convert to Python float
-                result.outliers_removed += h_outliers
-    
-    if result.vertical:
-        v_scales = [m.scale_pt_per_mm for m in result.vertical if m.validation.status == "valid"]
-        if v_scales:
-            v_scales_clean, v_outliers = detect_and_remove_outliers(v_scales)
-            if v_scales_clean:
-                result.vertical_average = round(float(np.mean(v_scales_clean)), 4)  # Convert to Python float
-                result.outliers_removed += v_outliers
-    
-    # Calculate final average with preference logic
-    if result.horizontal_average and result.vertical_average:
-        # Check consistency
-        deviation = abs(result.vertical_average - result.horizontal_average) / result.horizontal_average
-        result.scale_deviation = round(float(deviation * 100), 1)  # Convert to Python float
-        result.scales_consistent = bool(deviation < 0.15)  # Convert to Python bool
-        
-        if result.scales_consistent:
-            # Use combined average
-            all_valid_scales = []
-            all_valid_scales.extend([m.scale_pt_per_mm for m in result.horizontal if m.validation.status == "valid"])
-            all_valid_scales.extend([m.scale_pt_per_mm for m in result.vertical if m.validation.status == "valid"])
-            clean_scales, additional_outliers = detect_and_remove_outliers(all_valid_scales)
-            result.outliers_removed += additional_outliers
-            
-            if clean_scales:
-                result.average_scale_pt_per_mm = round(float(np.mean(clean_scales)), 4)  # Convert to Python float
-                result.average_scale_mm_per_pt = round(1 / result.average_scale_pt_per_mm, 4)
-                result.quality_flags.append("consistent_scales")
-        else:
-            # Prefer horizontal (more reliable)
-            result.average_scale_pt_per_mm = result.horizontal_average
-            result.average_scale_mm_per_pt = round(1 / result.horizontal_average, 4)
-            result.quality_flags.append("horizontal_preferred")
-            
-    elif result.horizontal_average:
-        result.average_scale_pt_per_mm = result.horizontal_average
-        result.average_scale_mm_per_pt = round(1 / result.horizontal_average, 4)
-        result.quality_flags.append("horizontal_only")
-        
-    elif result.vertical_average:
-        result.average_scale_pt_per_mm = result.vertical_average
-        result.average_scale_mm_per_pt = round(1 / result.vertical_average, 4)
-        result.quality_flags.append("vertical_only")
-    else:
-        # Use default
-        default_scale = DEFAULT_SCALES.get(drawing_type, 0.057)
-        result.average_scale_pt_per_mm = default_scale
-        result.average_scale_mm_per_pt = round(1 / default_scale, 4)
-        result.quality_flags.append("default_used")
-    
-    # Set validation status and confidence
-    if result.average_scale_pt_per_mm:
-        avg_confidence = 0
-        if result.horizontal or result.vertical:
-            all_confidences = [m.confidence for m in result.horizontal + result.vertical]
-            avg_confidence = float(np.mean(all_confidences)) if all_confidences else 0  # Convert to Python float
-        
-        result.confidence = round(avg_confidence, 1)
-        
-        if avg_confidence >= 80:
-            result.validation_status = "high_confidence"
-        elif avg_confidence >= 60:
-            result.validation_status = "medium_confidence"
-        elif avg_confidence >= 40:
-            result.validation_status = "low_confidence"
-        else:
-            result.validation_status = "poor_confidence"
-    else:
-        result.validation_status = "no_valid_data"
-    
-    logger.info(f"  {region.label}: {result.total_calculations} calculations, "
-                f"average: {result.average_scale_pt_per_mm} pt/mm, "
-                f"confidence: {result.confidence}%")
+        scale_sum = sum(all_scale_values)
+        result.average_calculation_formula = f"({' + '.join([f'{s:.4f}' for s in all_scale_values])}) ÷ {len(all_scale_values)} = {avg_scale:.4f} pt/mm"
     
     return result
 
-@app.post("/calculate-scale/", response_model=EnhancedScaleOutput)
-async def calculate_scale_enhanced(input_data: FilteredInput, debug: bool = Query(False)):
-    """Enhanced scale calculation with validation and outlier detection"""
+@app.post("/calculate-scale/", response_model=ScaleOutput)
+async def calculate_scale(input_data: FilteredInput):
+    """
+    Calculate scale with Filter API v7.0.0 compatibility
+    - Uses parsed_drawing_type from Filter API for bestektekening regions
+    - Physical dimension based rules per drawing type
+    - Enhanced fallback strategies
+    - Maximum 15pt distance between text and line
+    """
     try:
-        logger.info(f"=== Enhanced Scale Calculation Start ===")
-        logger.info(f"Processing {input_data.drawing_type} with {len(input_data.regions)} regions")
+        if input_data.drawing_type == "installatietekening":
+            # Skip installatietekening
+            return ScaleOutput(
+                drawing_type=input_data.drawing_type,
+                total_regions=0,
+                total_calculations=0,
+                regions=[],
+                physical_dimension_info={"installatietekening": "skipped"},
+                processing_rules={"installatietekening": "skipped"},
+                timestamp=datetime.now().isoformat()
+            )
         
         region_results = []
-        valid_scales = []
-        total_stats = {
-            'calculations': 0,
-            'filtered_dimensions': 0,
-            'filtered_lines': 0,
-            'outliers_removed': 0
+        all_regional_scales = []
+        total_calculations = 0
+        processing_rules = {}
+        
+        # Get physical dimension info for this drawing type
+        strategy, dimension_mapping = get_physical_dimension_strategy(input_data.drawing_type)
+        physical_dimension_info = {
+            "drawing_type": input_data.drawing_type,
+            "strategy": strategy,
+            "dimension_mapping": dimension_mapping
         }
         
         # Process each region
         for region in input_data.regions:
-            if not region.lines or not region.texts:
-                logger.warning(f"Skipping region {region.label} - no lines or texts")
-                continue
-            
-            region_result = process_region_enhanced(region, input_data.drawing_type)
-            region_results.append(region_result)
-            
-            # Collect statistics
-            total_stats['calculations'] += region_result.total_calculations
-            total_stats['outliers_removed'] += region_result.outliers_removed
-            
-            # Collect valid scales for overall average
-            if (region_result.average_scale_pt_per_mm and 
-                region_result.validation_status in ["high_confidence", "medium_confidence"]):
-                valid_scales.append(region_result.average_scale_pt_per_mm)
+            if region.lines and region.texts:
+                region_result = process_region_with_physical_dimensions(region, input_data.drawing_type)
+                region_results.append(region_result)
+                
+                # Collect scales for global average
+                if region_result.average_scale_pt_per_mm:
+                    all_regional_scales.append(region_result.average_scale_pt_per_mm)
+                    total_calculations += region_result.total_calculations
+                
+                # Track processing rules
+                processing_rules[region.label] = region_result.region_rules
         
-        # Calculate overall average
-        overall_avg_pt_per_mm = None
-        overall_avg_mm_per_pt = None
+        # Calculate global averages
+        global_avg_scale = None
+        global_avg_scale_mm = None
+        global_formula = None
         
-        if valid_scales:
-            # Remove outliers from global average
-            clean_global_scales, global_outliers = detect_and_remove_outliers(valid_scales)
-            total_stats['outliers_removed'] += global_outliers
-            
-            if clean_global_scales:
-                overall_avg_pt_per_mm = round(np.mean(clean_global_scales), 4)
-                overall_avg_mm_per_pt = round(1 / overall_avg_pt_per_mm, 4)
-        
-        # Count confidence levels
-        high_conf = len([r for r in region_results if r.validation_status == "high_confidence"])
-        medium_conf = len([r for r in region_results if r.validation_status == "medium_confidence"])
-        low_conf = len([r for r in region_results if r.validation_status in ["low_confidence", "poor_confidence"]])
-        
-        # Build validation rules info
-        validation_rules = {
-            "min_dimension_thresholds": MIN_DIMENSION_THRESHOLDS,
-            "distance_thresholds": DISTANCE_THRESHOLDS,
-            "min_line_lengths": MIN_LINE_LENGTH_THRESHOLDS,
-            "scale_ranges": SCALE_RANGES,
-            "outlier_rules": OUTLIER_RULES,
-            "statistical_outlier_detection": "2_standard_deviations",
-            "horizontal_preference": "15%_deviation_threshold"
-        }
+        if all_regional_scales:
+            global_avg_scale = sum(all_regional_scales) / len(all_regional_scales)
+            global_avg_scale_mm = 1 / global_avg_scale
+            global_formula = f"({' + '.join([f'{s:.4f}' for s in all_regional_scales])}) ÷ {len(all_regional_scales)} = {global_avg_scale:.4f} pt/mm"
         
         # Build response
-        response = EnhancedScaleOutput(
+        response = ScaleOutput(
             drawing_type=input_data.drawing_type,
+            total_regions=len(region_results),
+            total_calculations=total_calculations,
             regions=region_results,
-            total_regions_processed=len(region_results),
-            total_calculations=total_stats['calculations'],
-            total_filtered_dimensions=total_stats['filtered_dimensions'],
-            total_filtered_lines=total_stats['filtered_lines'], 
-            total_outliers_removed=total_stats['outliers_removed'],
-            overall_average_pt_per_mm=overall_avg_pt_per_mm,
-            overall_average_mm_per_pt=overall_avg_mm_per_pt,
-            high_confidence_regions=high_conf,
-            medium_confidence_regions=medium_conf,
-            low_confidence_regions=low_conf,
-            validation_rules_applied=validation_rules,
+            global_average_scale_pt_per_mm=round(global_avg_scale, 4) if global_avg_scale else None,
+            global_average_scale_mm_per_pt=round(global_avg_scale_mm, 4) if global_avg_scale_mm else None,
+            global_average_formula=global_formula,
+            physical_dimension_info=physical_dimension_info,
+            processing_rules=processing_rules,
             timestamp=datetime.now().isoformat()
         )
-        
-        logger.info(f"\n=== Enhanced Scale Calculation Complete ===")
-        logger.info(f"Overall average: {overall_avg_pt_per_mm} pt/mm")
-        logger.info(f"High confidence regions: {high_conf}")
-        logger.info(f"Total outliers removed: {total_stats['outliers_removed']}")
         
         return response
         
     except Exception as e:
-        logger.error(f"Error during enhanced scale calculation: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Scale calculation error: {str(e)}")
 
 @app.get("/")
 async def root():
-    """Root endpoint with enhanced API information"""
+    """Root endpoint with API information"""
     return {
-        "title": "Enhanced Scale API",
-        "version": "8.0.0",
-        "description": "Advanced scale calculation with outlier detection and validation",
-        "enhancements": {
-            "dimension_filtering": {
-                "plattegrond": "Min 1000mm horizontal/vertical",
-                "bestektekening": "Min 2000mm horizontal, 800mm vertical", 
-                "doorsnede": "Min 1500mm horizontal, 800mm vertical (filters 420mm)",
-                "purpose": "Remove small dimensions that cause extreme scales"
+        "title": "Scale API v7.0.0 - Filter API v7.0.0 Compatible",
+        "version": "7.0.0",
+        "description": "Physical dimension based scale calculation with Vision compatible bestektekening support",
+        "new_features_v7": [
+            "✅ Compatible with Filter API v7.0.0 parsed_drawing_type field",
+            "✅ Physical dimension mapping per drawing type",
+            "✅ Enhanced fallback strategies for difficult cases",
+            "✅ Vision compatible bestektekening region processing",
+            "✅ Comprehensive calculation formulas and detailed output"
+        ],
+        "physical_dimension_mapping": {
+            "plattegrond": {
+                "horizontal_line": "breedte (kamer/gebouw)",
+                "vertical_line": "lengte (kamer/gebouw)",
+                "strategy": "process_both",
+                "distance_method": "midpoint_to_midpoint",
+                "max_distance": "15pt"
             },
-            "line_filtering": {
-                "minimum_lengths": MIN_LINE_LENGTH_THRESHOLDS,
-                "purpose": "Filter short lines (~68pt) that cause unreliable scales"
+            "doorsnede": {
+                "vertical_line": "hoogte (verdieping/ruimte)",
+                "horizontal_line": "breedte (doorsnede-richting)",
+                "strategy": "process_both",
+                "distance_method": "text_to_line_edge",
+                "max_distance": "15pt"
             },
-            "outlier_detection": {
-                "global_limits": "0.025 - 0.12 pt/mm",
-                "ratio_limits": "12 - 40 mm/pt",
-                "statistical": "2 standard deviations",
-                "purpose": "Remove extreme values like 0.1821 and 0.0106 pt/mm"
+            "gevelaanzicht": {
+                "vertical_line": "hoogte (gebouw/verdieping/ramen)",
+                "horizontal_line": "IGNORE (niet gemeten)",
+                "strategy": "vertical_only",
+                "distance_method": "text_to_line_edge",
+                "max_distance": "15pt"
             },
-            "enhanced_validation": {
-                "confidence_scoring": "Distance + length + validation quality",
-                "scale_consistency": "15% deviation threshold",
-                "horizontal_preference": "When vertical scales inconsistent",
-                "quality_flags": "Track processing decisions per region"
+            "detailtekening_kozijn": {
+                "horizontal_line": "breedte (kozijn)",
+                "vertical_line": "hoogte (kozijn)",
+                "strategy": "process_both",
+                "distance_method": "midpoint_to_midpoint",
+                "max_distance": "10pt"
             },
-            "distance_improvements": {
-                "normal_threshold": "15pt (increased from 10pt)",
-                "fallback_threshold": "25pt maximum",
-                "purpose": "Better matching while maintaining quality"
+            "detailtekening_plattegrond": {
+                "horizontal_line": "breedte",
+                "vertical_line": "lengte", 
+                "strategy": "process_both",
+                "distance_method": "midpoint_to_midpoint",
+                "max_distance": "10pt"
+            },
+            "bestektekening": {
+                "strategy": "per_region_rules",
+                "description": "Uses parsed_drawing_type from Filter API v7.0.0",
+                "rules": "Determined by individual region drawing types"
             }
         },
-        "problem_solutions": {
-            "420mm_dimensions": "Filtered out by minimum thresholds",
-            "short_lines_68pt": "Filtered out by minimum line length",
-            "extreme_scales": "Removed by outlier detection",
-            "inconsistent_regions": "Horizontal preference applied",
-            "level_indicators": "Detected and marked as suspect (+3420P, +6410P)"
+        "distance_calculation_methods": {
+            "midpoint_to_midpoint": {
+                "description": "Euclidean distance between text midpoint and line midpoint",
+                "used_for": ["plattegrond", "detailtekening types"],
+                "reason": "Maatlijnen liggen naast objecten"
+            },
+            "text_to_line_edge": {
+                "description": "Distance from text midpoint to closest line edge (top/bottom/left/right)",
+                "used_for": ["gevelaanzicht", "doorsnede"],
+                "reason": "Dimensies staan bij lijn-einden"
+            }
         },
-        "validation_hierarchy": {
-            "1_dimension_filtering": "Remove dimensions below thresholds",
-            "2_line_filtering": "Remove lines below minimum length", 
-            "3_distance_filtering": "Apply normal and fallback thresholds",
-            "4_scale_validation": "Check against expected ranges",
-            "5_outlier_removal": "Statistical and rule-based outlier detection",
-            "6_consistency_check": "Compare horizontal vs vertical scales",
-            "7_preference_logic": "Horizontal-first fallback strategy"
+        "fallback_strategies": {
+            "gevelaanzicht": [
+                "1. Increased distance (25pt, 40pt) with text-to-line-edge",
+                "2. Switch to midpoint-to-midpoint method (20pt)",
+                "3. Total height reference calculation (highest dimension + longest vertical line)"
+            ],
+            "doorsnede": [
+                "1. Increased distance (25pt, 40pt) with text-to-line-edge", 
+                "2. Switch to midpoint-to-midpoint method (20pt)"
+            ],
+            "other_types": [
+                "Standard distance increase if no matches found"
+            ]
         },
-        "confidence_levels": {
-            "high_confidence": "80%+ (reliable for production use)",
-            "medium_confidence": "60-79% (acceptable with monitoring)",
-            "low_confidence": "40-59% (needs review)",
-            "poor_confidence": "<40% (fallback to defaults)"
+        "calculation_output": {
+            "per_calculation": {
+                "includes": ["exact formula", "distance used", "method applied", "physical dimension type"],
+                "example": "124.5pt ÷ 3000mm = 0.0415 pt/mm"
+            },
+            "per_region": {
+                "includes": ["up to 3 horizontal + 3 vertical calculations", "regional average", "average formula"],
+                "example": "(0.0415 + 0.0398 + 0.0401) ÷ 3 = 0.0405 pt/mm"
+            },
+            "global": {
+                "includes": ["average across all regions", "total calculations", "global formula"],
+                "example": "Average of all regional averages"
+            }
         },
-        "quality_flags": {
-            "consistent_scales": "Horizontal and vertical within 15%",
-            "horizontal_preferred": "Vertical inconsistent, used horizontal",
-            "horizontal_only": "Only horizontal scales found",
-            "vertical_only": "Only vertical scales found",
-            "default_used": "No valid scales, used drawing type default"
+        "bestektekening_handling": {
+            "filter_api_integration": "Uses parsed_drawing_type field from Filter API v7.0.0",
+            "fallback_parsing": "Can parse region labels if parsed_drawing_type not available",
+            "per_region_rules": "Each region gets appropriate rules based on its drawing type",
+            "examples": {
+                "plattegrond_region": "midpoint_to_midpoint, 15pt max",
+                "gevel_region": "text_to_line_edge, 15pt max, vertical only",
+                "doorsnede_region": "text_to_line_edge, 15pt max, both orientations",
+                "detail_region": "midpoint_to_midpoint, 10pt max"
+            }
         },
-        "compatibility": {
-            "input": "Compatible with Filter API output (orientation optional)",
-            "pydantic": "v2.6.4 with enhanced validation models",
-            "numpy": "v2.0.0 for statistical operations",
-            "filter_api_versions": "v6.0+ and v7.0+ (with/without text orientation)"
+        "matching_strategy": {
+            "orientation_determination": "Based on line orientation (not text)",
+            "selection_criteria": "Best distance matches first",
+            "duplicate_prevention": "No reuse of texts or lines within region",
+            "flexibility": "1-6 matches per region depending on availability and quality"
+        },
+        "supported_drawing_types": [
+            "plattegrond", "doorsnede", "gevelaanzicht",
+            "detailtekening_kozijn", "detailtekening_plattegrond", 
+            "detailtekening", "bestektekening"
+        ],
+        "skipped_drawing_types": ["installatietekening"],
+        "api_compatibility": {
+            "filter_api": "v7.0.0 (uses parsed_drawing_type field)",
+            "master_api": "v4.1.0 (requires field name updates)",
+            "vision_api": "Compatible with new bestektekening region format"
         },
         "endpoints": {
-            "/calculate-scale/": "Enhanced scale calculation with validation",
-            "/health/": "Health check with validation rules status",
+            "/calculate-scale/": "Main scale calculation endpoint",
+            "/health/": "Health check with feature status",
             "/": "This comprehensive documentation"
         }
     }
 
 @app.get("/health/")
 async def health_check():
-    """Enhanced health check with validation rules"""
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "8.0.0",
+        "version": "7.0.0",
         "port": PORT,
-        "validation_rules_active": {
-            "dimension_filtering": True,
-            "line_filtering": True,
-            "outlier_detection": True,
-            "statistical_analysis": True,
-            "horizontal_preference": True,
-            "confidence_scoring": True
+        "features": {
+            "filter_api_v7_compatibility": True,
+            "physical_dimension_mapping": True,
+            "bestektekening_support": True,
+            "fallback_strategies": True,
+            "vision_compatible": True
         },
-        "thresholds_configured": {
-            "min_dimensions": MIN_DIMENSION_THRESHOLDS,
-            "min_line_lengths": MIN_LINE_LENGTH_THRESHOLDS,
-            "distance_limits": DISTANCE_THRESHOLDS,
-            "scale_ranges": SCALE_RANGES,
-            "outlier_limits": OUTLIER_RULES
-        },
-        "problem_filters": {
-            "420mm_dimensions": "Filtered by MIN_DIMENSION_THRESHOLDS",
-            "68pt_lines": "Filtered by MIN_LINE_LENGTH_THRESHOLDS", 
-            "extreme_scales": "Removed by OUTLIER_RULES",
-            "inconsistent_verticals": "Handled by horizontal preference",
-            "level_indicators": "Detected by enhanced pattern matching"
-        },
-        "expected_improvements": {
-            "reliability": "Remove 50% of problematic calculations",
-            "consistency": "Better region-level scale agreement",
-            "confidence": "Higher confidence scores for valid data",
-            "transparency": "Detailed validation reporting"
-        },
-        "numpy_available": True,
-        "statistical_functions": ["mean", "std", "outlier_detection"],
-        "enhanced_features_enabled": True
+        "supported_drawing_types": [
+            "plattegrond", "doorsnede", "gevelaanzicht",
+            "detailtekening_kozijn", "detailtekening_plattegrond", 
+            "detailtekening", "bestektekening"
+        ],
+        "skipped_types": ["installatietekening"],
+        "max_distances": {
+            "plattegrond": "15pt (midpoint-to-midpoint)",
+            "gevelaanzicht": "15pt (text-to-line-edge)",
+            "doorsnede": "15pt (text-to-line-edge)",
+            "detailtekening": "10pt (midpoint-to-midpoint)"
+        }
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Enhanced Scale API v8.0.0 on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
