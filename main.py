@@ -544,7 +544,7 @@ def process_region_enhanced(region: RegionData, drawing_type: str) -> RegionScal
         if h_scales:
             h_scales_clean, h_outliers = detect_and_remove_outliers(h_scales)
             if h_scales_clean:
-                result.horizontal_average = round(np.mean(h_scales_clean), 4)
+                result.horizontal_average = round(float(np.mean(h_scales_clean)), 4)  # Convert to Python float
                 result.outliers_removed += h_outliers
     
     if result.vertical:
@@ -552,15 +552,15 @@ def process_region_enhanced(region: RegionData, drawing_type: str) -> RegionScal
         if v_scales:
             v_scales_clean, v_outliers = detect_and_remove_outliers(v_scales)
             if v_scales_clean:
-                result.vertical_average = round(np.mean(v_scales_clean), 4)
+                result.vertical_average = round(float(np.mean(v_scales_clean)), 4)  # Convert to Python float
                 result.outliers_removed += v_outliers
     
     # Calculate final average with preference logic
     if result.horizontal_average and result.vertical_average:
         # Check consistency
         deviation = abs(result.vertical_average - result.horizontal_average) / result.horizontal_average
-        result.scale_deviation = round(deviation * 100, 1)
-        result.scales_consistent = deviation < 0.15  # 15% threshold
+        result.scale_deviation = round(float(deviation * 100), 1)  # Convert to Python float
+        result.scales_consistent = bool(deviation < 0.15)  # Convert to Python bool
         
         if result.scales_consistent:
             # Use combined average
@@ -571,7 +571,7 @@ def process_region_enhanced(region: RegionData, drawing_type: str) -> RegionScal
             result.outliers_removed += additional_outliers
             
             if clean_scales:
-                result.average_scale_pt_per_mm = round(np.mean(clean_scales), 4)
+                result.average_scale_pt_per_mm = round(float(np.mean(clean_scales)), 4)  # Convert to Python float
                 result.average_scale_mm_per_pt = round(1 / result.average_scale_pt_per_mm, 4)
                 result.quality_flags.append("consistent_scales")
         else:
@@ -601,7 +601,7 @@ def process_region_enhanced(region: RegionData, drawing_type: str) -> RegionScal
         avg_confidence = 0
         if result.horizontal or result.vertical:
             all_confidences = [m.confidence for m in result.horizontal + result.vertical]
-            avg_confidence = np.mean(all_confidences) if all_confidences else 0
+            avg_confidence = float(np.mean(all_confidences)) if all_confidences else 0  # Convert to Python float
         
         result.confidence = round(avg_confidence, 1)
         
